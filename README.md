@@ -49,7 +49,17 @@ The script will authenticate automatically before downloading the model.
 
 ```bash
 source /tmp/python-venv/llm_scoring_venv/bin/activate
-python scripts/run_experiment.py --dataset agnews --epsilon 1.0
+python scripts/run_experiment.py \
+  --dataset agnews \
+  --epsilon 3.0 \
+  --num_examples 1000 \
+  --batch_size 255 \
+  --clip_bound 10.0 \
+  --temperature 2.0 \
+  --public_temperature 1.5 \
+  --svt_threshold 0.5 \
+  --svt_noise 0.2 \
+  --max_private_tokens 64
 ```
 
 ## Project Structure

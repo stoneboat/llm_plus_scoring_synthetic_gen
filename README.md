@@ -9,14 +9,15 @@ Paper: https://arxiv.org/abs/2407.12108
 
 This project implements the private prediction algorithm for generating differentially
 private synthetic text using LLMs. The core insight is that standard softmax sampling
-from an LLM is equivalent to the exponential mechanism, enabling private token selection
-without adding explicit noise beyond logit clipping and averaging.
+from an LLM is distributionally equivalent to the exponential mechanism, so once logit
+clipping and aggregation bound score sensitivity, token selection can be analyzed
+without adding explicit noise to the logits themselves.
 
 Key components:
 - **Logit clipping with recentering** — bounds sensitivity for the exponential mechanism
 - **Sparse vector technique (SVT)** — skips privacy cost for tokens predictable from public data
 - **zCDP privacy accounting** — via Google's `dp-accounting` library
-- **Parallel composition** — fixed disjoint batches instead of re-sampling
+- **Parallel composition** — fixed, hash-based disjoint batches instead of re-sampling
 
 ## Setup
 

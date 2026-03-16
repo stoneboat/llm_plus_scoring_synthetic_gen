@@ -5,6 +5,11 @@ Computes (epsilon, delta)-DP guarantees using Theorem 1 from Amin et al. (2024).
 Uses Google's dp-accounting library for the standard zCDP-to-(eps,delta) conversion,
 and implements the paper-specific rho formula.
 
+Important assumption: the exponential-mechanism term below uses score
+sensitivity Delta q = c / s, which matches the paper's add/remove-style
+neighboring relation for the clipped-and-aggregated logits. Under a
+replace-one adjacency notion the sensitivity would be 2c / s instead.
+
 Theorem 1: rho = r * (1/2 * (c/(s*tau))^2 + 2/(s*sigma)^2)
 
 where:

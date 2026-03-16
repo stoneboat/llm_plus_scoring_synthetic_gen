@@ -56,12 +56,19 @@ def assign_to_batch(prompt_text: str, num_batches: int) -> int:
 def partition_by_label(
     examples: List[dict],
     label_column: str,
+    text_column: str,
     batch_size: int,
 ) -> Dict[int, List[List[dict]]]:
-    """Partition examples into batches, grouped by label.
+    """Partition examples into stable, disjoint batches grouped by label.
 
     Returns a dict mapping label -> list of batches, where each batch
     is a list of examples of size approximately batch_size.
+
+    The assignment is hash-based rather than slice-based so a record's batch
+    membership depends only on that record. This is the fixed-assignment
+    property needed for the paper's parallel-composition argument: adding or
+    removing one example affects only the batch containing that example, rather
+    than shifting many later examples between batches.
     """
     by_label: Dict[int, List[dict]] = {}
     for ex in examples:
@@ -70,11 +77,25 @@ def partition_by_label(
 
     batches_by_label: Dict[int, List[List[dict]]] = {}
     for label, label_examples in by_label.items():
-        batches = []
-        for i in range(0, len(label_examples), batch_size):
-            batch = label_examples[i : i + batch_size]
-            batches.append(batch)
-        batches_by_label[label] = batches
+        num_batches = max(1, math.ceil(len(label_examples) / batch_size))
+        buckets: List[List[dict]] = [[] for _ in range(num_batches)]
+
+        for ex in label_examples:
+            # Include the label in the hash key so identical texts from
+            # different labels cannot collide into the same label-local bucket.
+            key = f"{label}\n{ex[text_column]}"
+            batch_idx = assign_to_batch(key, num_batches)
+            buckets[batch_idx].append(ex)
+
+        # Drop empty buckets and sort deterministically for reproducibility.
+        non_empty_batches = []
+        for bucket in buckets:
+            if not bucket:
+                continue
+            bucket.sort(key=lambda ex: ex[text_column])
+            non_empty_batches.append(bucket)
+
+        batches_by_label[label] = non_empty_batches
 
     return batches_by_label
 
@@ -297,7 +318,9 @@ def generate_synthetic_dataset(
         privacy_config.delta = delta
 
     # Partition into batches by label
-    batches_by_label = partition_by_label(examples, label_column, gen_config.batch_size)
+    batches_by_label = partition_by_label(
+        examples, label_column, text_column, gen_config.batch_size
+    )
 
     total_batches = sum(len(bs) for bs in batches_by_label.values())
     if verbose:

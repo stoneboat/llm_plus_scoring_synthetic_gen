@@ -23,6 +23,11 @@ def compute_distribution_distance(
     Implements Eq. 2:
         d(Z, z_public) = || (1/s) sum_{z in Z} softmax(z) - softmax(z_public) ||_1
 
+    Under add/remove adjacency, this scalar query has sensitivity at most 1/s:
+    adding or removing one private record changes the mean private
+    distribution by one probability vector scaled by 1/s, and probability
+    vectors have L1 norm 1.
+
     Args:
         private_logits_batch: shape (batch, vocab_size). Raw logits for each
             sensitive prompt.
@@ -70,7 +75,8 @@ def should_use_private_token(
         public_logits: shape (vocab_size,).
         expected_batch_size: s.
         noisy_threshold: theta_hat (pre-sampled noisy threshold).
-        noise_scale: sigma, for the query noise Laplace(2*sigma).
+        noise_scale: sigma, for threshold noise Laplace(sigma) and query
+            noise Laplace(2*sigma), matching the paper's SVT parameterization.
 
     Returns:
         Tuple of (use_private: bool, noisy_distance: float).

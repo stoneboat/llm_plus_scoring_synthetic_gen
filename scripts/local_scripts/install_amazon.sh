@@ -16,6 +16,18 @@ echo "Repo root: $REPO_ROOT"
 echo ""
 
 # -----------------------------------------------
+# Phase 0: Disable IPv6 (prevents HuggingFace hangs on EC2)
+# -----------------------------------------------
+echo "--- Phase 0: Network fix (disable IPv6) ---"
+if sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null \
+   && sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null; then
+    echo "IPv6 disabled — HuggingFace requests will use IPv4."
+else
+    echo "WARNING: Could not disable IPv6 (no sudo?). HuggingFace downloads may hang."
+fi
+echo ""
+
+# -----------------------------------------------
 # Phase 1: GPU setup (Amazon-specific)
 # -----------------------------------------------
 echo "--- Phase 1: GPU setup ---"
@@ -46,70 +58,44 @@ fi
 echo ""
 
 # -----------------------------------------------
-# Phase 2: Conda bootstrap
+# Phase 2: Create virtual environment in /tmp
 # -----------------------------------------------
-echo "--- Phase 2: Conda bootstrap ---"
-
-USE_CONDA=false
-if command -v conda &>/dev/null; then
-    eval "$(conda shell.bash hook)"
-    echo "Conda found: $(conda --version)"
-    USE_CONDA=true
-elif [ -f "$HOME/miniconda3/bin/conda" ]; then
-    eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
-    echo "Conda found at ~/miniconda3: $(conda --version)"
-    USE_CONDA=true
-else
-    echo "Conda not found. Attempting to install Miniconda..."
-    MINICONDA_INSTALLER="/tmp/Miniconda3-latest-Linux-x86_64.sh"
-    if wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O "$MINICONDA_INSTALLER" 2>/dev/null; then
-        bash "$MINICONDA_INSTALLER" -b -p "$HOME/miniconda3" \
-            || { echo "Miniconda installation failed" >&2; exit 1; }
-        rm -f "$MINICONDA_INSTALLER"
-        eval "$($HOME/miniconda3/bin/conda shell.bash hook)"
-        echo "Miniconda installed: $(conda --version)"
-        USE_CONDA=true
-    else
-        echo "Could not download Miniconda (no network?). Falling back to Python venv."
-        rm -f "$MINICONDA_INSTALLER"
-    fi
-fi
-echo ""
-
-# -----------------------------------------------
-# Phase 3: Create virtual environment in /tmp
-# -----------------------------------------------
-echo "--- Phase 3: Virtual environment ---"
+echo "--- Phase 2: Virtual environment ---"
 
 mkdir -p /tmp/python-venv
 
-if $USE_CONDA; then
-    if [ -d "$ENV_DIR" ]; then
-        echo "Conda env '$ENV_NAME' already exists at $ENV_DIR"
-    else
-        echo "Creating conda env '$ENV_NAME' at $ENV_DIR..."
-        conda create --prefix "$ENV_DIR" python=3.11 -y \
-            || { echo "conda create failed" >&2; exit 1; }
-    fi
-    conda activate "$ENV_DIR" || { echo "conda activate failed" >&2; exit 1; }
-else
-    if [ -d "$ENV_DIR" ]; then
-        echo "Python venv '$ENV_NAME' already exists at $ENV_DIR"
-    else
-        echo "Creating Python venv '$ENV_NAME' at $ENV_DIR..."
-        python3 -m venv "$ENV_DIR" \
-            || { echo "python3 -m venv failed" >&2; exit 1; }
-    fi
-    source "$ENV_DIR/bin/activate" || { echo "venv activate failed" >&2; exit 1; }
+# If the directory exists but activate is missing, it's a broken venv — remove and recreate
+if [ -d "$ENV_DIR" ] && [ ! -f "$ENV_DIR/bin/activate" ]; then
+    echo "Detected broken venv at $ENV_DIR (missing activate). Removing and recreating..."
+    rm -rf "$ENV_DIR"
 fi
+
+if [ -d "$ENV_DIR" ]; then
+    echo "Python venv '$ENV_NAME' already exists at $ENV_DIR"
+else
+    echo "Creating Python venv '$ENV_NAME' at $ENV_DIR..."
+    # --without-pip avoids the ensurepip dependency (broken on held python3 packages)
+    python3 -m venv --without-pip "$ENV_DIR" \
+        || { echo "python3 -m venv failed" >&2; exit 1; }
+
+    # Bootstrap pip manually via get-pip.py
+    echo "Bootstrapping pip via get-pip.py..."
+    GET_PIP="/tmp/get-pip.py"
+    wget -q https://bootstrap.pypa.io/get-pip.py -O "$GET_PIP" \
+        || { echo "Failed to download get-pip.py" >&2; exit 1; }
+    "$ENV_DIR/bin/python3" "$GET_PIP" \
+        || { echo "get-pip.py failed" >&2; exit 1; }
+    rm -f "$GET_PIP"
+fi
+source "$ENV_DIR/bin/activate" || { echo "venv activate failed" >&2; exit 1; }
 
 echo "Active Python: $(which python) ($(python --version))"
 echo ""
 
 # -----------------------------------------------
-# Phase 4: Install from requirements.txt
+# Phase 3: Install from requirements.txt
 # -----------------------------------------------
-echo "--- Phase 4: Install Python dependencies ---"
+echo "--- Phase 3: Install Python dependencies ---"
 
 pip install --upgrade pip || { echo "pip upgrade failed" >&2; exit 1; }
 
@@ -119,12 +105,16 @@ if [ -f "$REPO_ROOT/requirements.txt" ] && [ -s "$REPO_ROOT/requirements.txt" ];
 else
     echo "WARNING: requirements.txt not found or empty at $REPO_ROOT" >&2
 fi
+
+# Ensure a recent huggingface_hub (older versions lack the CLI and login API)
+pip install -U "huggingface_hub>=0.23.0" \
+    || { echo "huggingface_hub upgrade failed" >&2; exit 1; }
 echo ""
 
 # -----------------------------------------------
-# Phase 5: Verify GPU + PyTorch
+# Phase 4: Verify GPU + PyTorch
 # -----------------------------------------------
-echo "--- Phase 5: GPU + PyTorch verification ---"
+echo "--- Phase 4: GPU + PyTorch verification ---"
 
 python -c "
 import torch
@@ -133,22 +123,46 @@ print(f'CUDA compiled: {torch.version.cuda}')
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        print(f'GPU {i}: {props.name}, VRAM: {props.total_mem / 1e9:.1f} GB')
+        print(f'GPU {i}: {props.name}, VRAM: {props.total_memory / 1e9:.1f} GB')
 else:
     print('WARNING: CUDA not available in PyTorch. GPU ops will fail until /dev/nvidia* is accessible.')
 " || { echo "PyTorch verification failed" >&2; exit 1; }
 echo ""
 
 # -----------------------------------------------
-# Phase 6: Download Gemma 2B model
+# Phase 5: Download Gemma 2B model
 # -----------------------------------------------
-echo "--- Phase 6: Download model ---"
+echo "--- Phase 5: Download model ---"
 
 if [ -d "$MODEL_DIR" ] && [ "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]; then
     echo "Model already exists at $MODEL_DIR, skipping download."
 else
     echo "Downloading $MODEL_ID to $MODEL_DIR..."
     mkdir -p "$MODEL_DIR"
+
+    # Authenticate if HF_TOKEN is set; otherwise rely on cached credentials
+    if [ -n "$HF_TOKEN" ]; then
+        echo "HF_TOKEN found — logging in to HuggingFace..."
+        python -c "from huggingface_hub import login; login(token='$HF_TOKEN')" \
+            || { echo "HuggingFace login failed" >&2; exit 1; }
+    elif [ ! -f "$HOME/.cache/huggingface/token" ] && [ ! -f "$HOME/.huggingface/token" ]; then
+        echo "" >&2
+        echo "ERROR: Gemma is a gated model and no credentials were found." >&2
+        echo "Please authenticate first, then re-run this script:" >&2
+        echo "" >&2
+        echo "  Option A — environment variable (recommended for automation):" >&2
+        echo "    export HF_TOKEN=hf_YOUR_TOKEN" >&2
+        echo "    bash $0" >&2
+        echo "" >&2
+        echo "  Option B — interactive login:" >&2
+        echo "    source $ENV_DIR/bin/activate" >&2
+        echo "    python -c \"from huggingface_hub import login; login(token='hf_YOUR_TOKEN')\"" >&2
+        echo "" >&2
+        echo "Get a token at: https://huggingface.co/settings/tokens" >&2
+        echo "Accept the license at: https://huggingface.co/google/gemma-2-2b-it" >&2
+        exit 1
+    fi
+
     python -c "
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import os
@@ -161,14 +175,14 @@ print(f'Downloading model from {model_id}...')
 model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype='auto')
 model.save_pretrained(save_dir)
 print(f'Model saved to {save_dir}')
-" || { echo "Model download failed. You may need to run: huggingface-cli login" >&2; exit 1; }
+" || { echo "Model download failed." >&2; exit 1; }
 fi
 echo ""
 
 # -----------------------------------------------
-# Phase 7: Register Jupyter kernel
+# Phase 6: Register Jupyter kernel
 # -----------------------------------------------
-echo "--- Phase 7: Jupyter kernel ---"
+echo "--- Phase 6: Jupyter kernel ---"
 
 python -m ipykernel uninstall --user --name=llm-scoring-env -y 2>/dev/null || true
 
@@ -199,18 +213,14 @@ echo ""
 # -----------------------------------------------
 # Done
 # -----------------------------------------------
-if $USE_CONDA; then
-    conda deactivate
-else
-    deactivate 2>/dev/null || true
-fi
+deactivate 2>/dev/null || true
 
 echo "============================================"
 echo "  Installation complete!"
 echo "============================================"
 echo ""
 echo "To activate the environment:"
-echo "  conda activate $ENV_DIR"
+echo "  source $ENV_DIR/bin/activate"
 echo ""
 echo "To run an experiment:"
 echo "  python scripts/run_experiment.py --dataset agnews --epsilon 1.0"

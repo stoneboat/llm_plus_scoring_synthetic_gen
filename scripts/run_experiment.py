@@ -17,6 +17,9 @@ import os
 import sys
 import time
 
+# Reduce CUDA memory fragmentation, especially with large-vocabulary models
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 # Add project root to path so src/ is importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -146,6 +149,8 @@ def main():
                         help="Directory for output files")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--micro_batch_size", type=int, default=32,
+                        help="Prompts per GPU forward pass (reduce if OOM, default 32)")
 
     args = parser.parse_args()
 
@@ -222,6 +227,7 @@ def main():
         label_column="label",
         device=args.device,
         verbose=True,
+        micro_batch_size=args.micro_batch_size,
     )
 
     elapsed = time.time() - t0

@@ -112,11 +112,17 @@ def get_next_token_logits(
     prompts: List[str],
     generated_tokens: List[int],
     device: str = "cuda",
+    micro_batch_size: int = 32,
 ) -> Tensor:
     """Run LLM inference to get next-token logits for a set of prompts.
 
     Each prompt is concatenated with the generated tokens so far, then
     we extract the logits for the next position.
+
+    Processes prompts in micro-batches to avoid GPU OOM when batch_size
+    is large (e.g. 255) and the model has a large vocabulary (e.g. Gemma 2
+    with 256k tokens), since the logits tensor would be
+    (batch × seq_len × vocab_size) which can exceed GPU memory.
 
     Args:
         model: HuggingFace causal LM.
@@ -124,6 +130,7 @@ def get_next_token_logits(
         prompts: list of prompt strings.
         generated_tokens: token IDs generated so far (shared across all prompts).
         device: torch device.
+        micro_batch_size: number of prompts to forward at once. Reduce if OOM.
 
     Returns:
         Logits tensor of shape (len(prompts), vocab_size).
@@ -134,17 +141,23 @@ def get_next_token_logits(
     else:
         full_texts = prompts
 
-    inputs = tokenizer(
-        full_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(device)
+    all_last_logits: List[Tensor] = []
 
-    outputs = model(**inputs)
-    # Extract logits at the last position for each sequence
-    last_logits = outputs.logits[:, -1, :]  # (batch, vocab_size)
-    return last_logits
+    for i in range(0, len(full_texts), micro_batch_size):
+        chunk = full_texts[i : i + micro_batch_size]
+        inputs = tokenizer(
+            chunk,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(device)
+
+        outputs = model(**inputs)
+        # Extract logits at the last position only — shape (chunk, vocab_size)
+        last_logits = outputs.logits[:, -1, :].cpu()
+        all_last_logits.append(last_logits)
+
+    return torch.cat(all_last_logits, dim=0).to(device)
 
 
 @torch.no_grad()
@@ -156,6 +169,7 @@ def generate_one_example(
     privacy_config: PrivacyConfig,
     gen_config: GenerationConfig,
     device: str = "cuda",
+    micro_batch_size: int = 32,
 ) -> Tuple[List[int], int, int]:
     """Generate one synthetic example from a batch of sensitive prompts.
 
@@ -196,13 +210,15 @@ def generate_one_example(
     while private_token_count < r and len(generated_tokens) < gen_config.max_total_tokens:
         # Get logits from all private prompts
         private_logits = get_next_token_logits(
-            model, tokenizer, private_prompts, generated_tokens, device
+            model, tokenizer, private_prompts, generated_tokens, device,
+            micro_batch_size=micro_batch_size,
         )
 
         if svt_enabled:
             # Get logits from public prompt
             public_logits = get_next_token_logits(
-                model, tokenizer, [public_prompt], generated_tokens, device
+                model, tokenizer, [public_prompt], generated_tokens, device,
+                micro_batch_size=micro_batch_size,
             )[0]  # (vocab_size,)
 
             # SVT: decide private vs public
@@ -249,6 +265,7 @@ def generate_synthetic_dataset(
     label_column: str = "label",
     device: str = "cuda",
     verbose: bool = True,
+    micro_batch_size: int = 32,
 ) -> List[SyntheticExample]:
     """Generate a full synthetic dataset using Algorithm 1.
 
@@ -318,6 +335,7 @@ def generate_synthetic_dataset(
                 private_prompts, public_prompt,
                 privacy_config, gen_config,
                 device=device,
+                micro_batch_size=micro_batch_size,
             )
 
             text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()

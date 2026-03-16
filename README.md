@@ -26,13 +26,28 @@ Key components:
 bash scripts/local_scripts/install_amazon.sh
 ```
 
-This creates a conda environment in `/tmp/python-venv/llm_scoring_venv`, installs
+This creates a Python venv in `/tmp/python-venv/llm_scoring_venv`, installs
 all dependencies, downloads the Gemma 2B model, and registers a Jupyter kernel.
+
+#### HuggingFace authentication (required for Gemma)
+
+Gemma is a gated model. Before running the install script you must:
+
+1. Accept the license at <https://huggingface.co/google/gemma-2-2b-it>
+2. Create a token with **Read** access at <https://huggingface.co/settings/tokens>
+3. Pass your token to the install script via the `HF_TOKEN` environment variable:
+
+```bash
+export HF_TOKEN=hf_YOUR_TOKEN
+bash scripts/local_scripts/install_amazon.sh
+```
+
+The script will authenticate automatically before downloading the model.
 
 ### Running an experiment
 
 ```bash
-conda activate /tmp/python-venv/llm_scoring_venv
+source /tmp/python-venv/llm_scoring_venv/bin/activate
 python scripts/run_experiment.py --dataset agnews --epsilon 1.0
 ```
 

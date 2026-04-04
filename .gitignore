@@ -25,6 +25,7 @@ ENV/
 *.swp
 *.swo
 .codex/
+.codex
 .claude/
 
 # Environment files

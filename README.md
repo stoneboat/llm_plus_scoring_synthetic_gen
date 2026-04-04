@@ -52,15 +52,24 @@ source /tmp/python-venv/llm_scoring_venv/bin/activate
 python scripts/run_experiment.py \
   --dataset agnews \
   --epsilon 3.0 \
-  --num_examples 1000 \
   --batch_size 255 \
   --clip_bound 10.0 \
   --temperature 2.0 \
+  --top_k_vocab 1024 \
   --public_temperature 1.5 \
   --svt_threshold 0.5 \
-  --svt_noise 0.2 \
-  --max_private_tokens 64
+  --svt_noise 0.2
 ```
+
+This example is aligned with the hyperparameter settings explored in Amin et al. (2024) for AG News.
+It uses the full training split by default and lets the script compute `max_private_tokens` from
+`epsilon`, `delta = 1/n`, and the chosen mechanism parameters. If you want to reproduce the paper's
+selection procedure more closely, run `scripts/sweep_hyperparams.py` and choose the best AG News
+configuration on a held-out validation split.
+
+Runs are checkpointed batch-by-batch to the output JSONL as they execute. If a long run is interrupted,
+resume it with the same arguments plus `--resume`. By default, the runner will pick the latest matching
+checkpoint in `data/outputs`; use `--output_path /path/to/file.jsonl` if you want to resume a specific file.
 
 ## Project Structure
 

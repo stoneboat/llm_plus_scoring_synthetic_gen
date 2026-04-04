@@ -14,7 +14,7 @@ synthetic text generation", Findings of EMNLP 2024.
 
 import math
 import hashlib
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
 
 import torch
@@ -42,6 +42,17 @@ class SyntheticExample:
     num_private_tokens: int
     num_public_tokens: int
     num_total_tokens: int
+
+
+@dataclass(frozen=True)
+class BatchDescriptor:
+    """Stable identifier and metadata for one generation batch."""
+    batch_id: str
+    batch_index: int
+    total_batches: int
+    label: int
+    label_name: str
+    batch_size: int
 
 
 def assign_to_batch(prompt_text: str, num_batches: int) -> int:
@@ -447,6 +458,8 @@ def generate_synthetic_dataset(
     device: str = "cuda",
     verbose: bool = True,
     micro_batch_size: int = 32,
+    completed_batch_ids: Optional[Set[str]] = None,
+    batch_callback: Optional[Callable[[BatchDescriptor, List[SyntheticExample]], None]] = None,
 ) -> List[SyntheticExample]:
     """Generate a full synthetic dataset using Algorithm 1.
 
@@ -461,6 +474,8 @@ def generate_synthetic_dataset(
         label_column: column name for label in examples.
         device: torch device.
         verbose: print progress.
+        completed_batch_ids: optional set of stable batch IDs to skip.
+        batch_callback: optional callback invoked after each completed batch.
 
     Returns:
         List of SyntheticExample objects.
@@ -503,6 +518,7 @@ def generate_synthetic_dataset(
         print(f"  {total_batches} batches, batch_size={gen_config.batch_size}")
         print()
 
+    completed_batch_ids = completed_batch_ids or set()
     synthetic_data: List[SyntheticExample] = []
     batch_idx = 0
     max_batch_private_tokens = 0
@@ -511,6 +527,25 @@ def generate_synthetic_dataset(
         label_name = templates["labels"][label]
         for batch in batches:
             batch_idx += 1
+            batch_key = "\n".join(ex[text_column] for ex in batch)
+            batch_id = hashlib.sha256(
+                f"{dataset_name}\n{label}\n{batch_key}".encode("utf-8")
+            ).hexdigest()
+            descriptor = BatchDescriptor(
+                batch_id=batch_id,
+                batch_index=batch_idx,
+                total_batches=total_batches,
+                label=label,
+                label_name=label_name,
+                batch_size=len(batch),
+            )
+
+            if batch_id in completed_batch_ids:
+                if verbose:
+                    print(f"  Batch {batch_idx}/{total_batches} "
+                          f"(label={label_name}, size={len(batch)}) [resume: skipped]")
+                continue
+
             if verbose:
                 print(f"  Batch {batch_idx}/{total_batches} "
                       f"(label={label_name}, size={len(batch)})")
@@ -528,6 +563,7 @@ def generate_synthetic_dataset(
                 micro_batch_size=micro_batch_size,
             )
 
+            batch_examples: List[SyntheticExample] = []
             batch_priv_total = 0
             batch_pub_total = 0
 
@@ -536,20 +572,25 @@ def generate_synthetic_dataset(
                     token_ids, skip_special_tokens=True,
                 ).strip()
 
-                synthetic_data.append(SyntheticExample(
+                example = SyntheticExample(
                     text=text,
                     label=label,
                     label_name=label_name,
                     num_private_tokens=n_priv,
                     num_public_tokens=n_pub,
                     num_total_tokens=len(token_ids),
-                ))
+                )
+                synthetic_data.append(example)
+                batch_examples.append(example)
                 batch_priv_total += n_priv
                 batch_pub_total += n_pub
 
             max_batch_private_tokens = max(
                 max_batch_private_tokens, batch_priv_total,
             )
+
+            if batch_callback is not None:
+                batch_callback(descriptor, batch_examples)
 
             if verbose:
                 n_ex = len(batch_results)

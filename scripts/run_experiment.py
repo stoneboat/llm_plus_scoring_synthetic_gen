@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import time
+from typing import Dict, List, Optional, Set, Tuple
 
 # Reduce CUDA memory fragmentation, especially with large-vocabulary models
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -34,8 +35,8 @@ from src.config import (
     compute_max_private_tokens,
 )
 from src.privacy_accounting import privacy_report
-from src.generate import generate_synthetic_dataset
-from src.evaluate import save_synthetic_data, compute_generation_stats
+from src.generate import BatchDescriptor, SyntheticExample, generate_synthetic_dataset
+from src.evaluate import compute_generation_stats
 
 
 DATASET_HF_MAP = {
@@ -109,6 +110,212 @@ def load_model(model_config: ModelConfig):
     return model, tokenizer
 
 
+def _jsonl_append_line(handle, record: dict) -> None:
+    handle.write(json.dumps(record) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _batch_record(ex: SyntheticExample, descriptor: BatchDescriptor) -> dict:
+    return {
+        "text": ex.text,
+        "label": ex.label,
+        "label_name": ex.label_name,
+        "num_private_tokens": ex.num_private_tokens,
+        "num_public_tokens": ex.num_public_tokens,
+        "num_total_tokens": ex.num_total_tokens,
+        "batch_id": descriptor.batch_id,
+        "batch_index": descriptor.batch_index,
+        "total_batches": descriptor.total_batches,
+    }
+
+
+def _load_resume_state(
+    output_path: str,
+) -> Tuple[Optional[dict], List[SyntheticExample], Set[str], Dict[str, BatchDescriptor]]:
+    """Load readable records from a checkpointed JSONL file.
+
+    Ignores a truncated or malformed tail line so the file remains usable after
+    an interrupted append.
+    """
+    metadata = None
+    batch_examples: Dict[str, List[SyntheticExample]] = {}
+    batch_descriptors: Dict[str, BatchDescriptor] = {}
+    completed_batch_ids: List[str] = []
+
+    with open(output_path) as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"Warning: ignoring unreadable JSONL tail at line {line_no} in {output_path}")
+                break
+
+            if "_metadata" in record:
+                metadata = record["_metadata"]
+                continue
+
+            if "_batch_complete" in record:
+                info = record["_batch_complete"]
+                batch_id = info["batch_id"]
+                batch_descriptors[batch_id] = BatchDescriptor(
+                    batch_id=batch_id,
+                    batch_index=info["batch_index"],
+                    total_batches=info["total_batches"],
+                    label=info["label"],
+                    label_name=info["label_name"],
+                    batch_size=info["batch_size"],
+                )
+                completed_batch_ids.append(batch_id)
+                continue
+
+            batch_id = record.get("batch_id")
+            if batch_id is None:
+                continue
+
+            batch_examples.setdefault(batch_id, []).append(SyntheticExample(
+                text=record["text"],
+                label=record["label"],
+                label_name=record["label_name"],
+                num_private_tokens=record["num_private_tokens"],
+                num_public_tokens=record["num_public_tokens"],
+                num_total_tokens=record["num_total_tokens"],
+            ))
+
+            batch_index = record.get("batch_index")
+            total_batches = record.get("total_batches")
+            if batch_index is not None and total_batches is not None:
+                batch_descriptors.setdefault(batch_id, BatchDescriptor(
+                    batch_id=batch_id,
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    label=record["label"],
+                    label_name=record["label_name"],
+                    batch_size=record.get("source_batch_size", 0),
+                ))
+
+    completed_batch_set = set(completed_batch_ids)
+    loaded_examples: List[SyntheticExample] = []
+    for batch_id in completed_batch_ids:
+        loaded_examples.extend(batch_examples.get(batch_id, []))
+
+    return metadata, loaded_examples, completed_batch_set, batch_descriptors
+
+
+def _write_metadata_header(output_path: str, metadata: dict) -> None:
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        _jsonl_append_line(f, {"_metadata": metadata})
+
+
+def _append_completed_batch(
+    output_path: str,
+    descriptor: BatchDescriptor,
+    examples: List[SyntheticExample],
+) -> None:
+    with open(output_path, "a") as f:
+        for ex in examples:
+            record = _batch_record(ex, descriptor)
+            record["source_batch_size"] = descriptor.batch_size
+            _jsonl_append_line(f, record)
+
+        _jsonl_append_line(f, {
+            "_batch_complete": {
+                "batch_id": descriptor.batch_id,
+                "batch_index": descriptor.batch_index,
+                "total_batches": descriptor.total_batches,
+                "label": descriptor.label,
+                "label_name": descriptor.label_name,
+                "batch_size": descriptor.batch_size,
+                "num_examples": len(examples),
+            }
+        })
+
+
+def _build_run_metadata(
+    args,
+    report: dict,
+    delta: float,
+    max_priv: int,
+    num_source_examples: int,
+    output_path: str,
+) -> dict:
+    return {
+        "dataset": args.dataset,
+        "epsilon": report["epsilon"],
+        "delta": delta,
+        "batch_size": args.batch_size,
+        "clip_bound": args.clip_bound,
+        "temperature": args.temperature,
+        "public_temperature": args.public_temperature,
+        "svt_threshold": args.svt_threshold,
+        "svt_noise": args.svt_noise,
+        "top_k_vocab": args.top_k_vocab,
+        "max_private_tokens": max_priv,
+        "max_total_tokens": args.max_total_tokens,
+        "num_source_examples": num_source_examples,
+        "seed": args.seed,
+        "micro_batch_size": args.micro_batch_size,
+        "output_path": output_path,
+        "checkpoint_format": 1,
+    }
+
+
+def _metadata_matches_args(metadata: dict, args, delta: float, max_priv: int, num_source_examples: int) -> bool:
+    expected = {
+        "dataset": args.dataset,
+        "delta": delta,
+        "batch_size": args.batch_size,
+        "clip_bound": args.clip_bound,
+        "temperature": args.temperature,
+        "public_temperature": args.public_temperature,
+        "svt_threshold": args.svt_threshold,
+        "svt_noise": args.svt_noise,
+        "top_k_vocab": args.top_k_vocab,
+        "max_private_tokens": max_priv,
+        "max_total_tokens": args.max_total_tokens,
+        "num_source_examples": num_source_examples,
+        "seed": args.seed,
+        "micro_batch_size": args.micro_batch_size,
+    }
+    for key, value in expected.items():
+        if metadata.get(key) != value:
+            return False
+    return True
+
+
+def _default_output_prefix(args) -> str:
+    return f"{args.dataset}_eps{args.epsilon}_s{args.batch_size}_"
+
+
+def _resolve_output_path(args) -> str:
+    if args.output_path:
+        return args.output_path
+
+    prefix = _default_output_prefix(args)
+    if args.resume:
+        if not os.path.isdir(args.output_dir):
+            raise FileNotFoundError(
+                f"--resume could not find output directory {args.output_dir}"
+            )
+        matches = sorted(
+            os.path.join(args.output_dir, name)
+            for name in os.listdir(args.output_dir)
+            if name.startswith(prefix) and name.endswith(".jsonl")
+        )
+        if not matches:
+            raise FileNotFoundError(
+                f"--resume could not find an existing checkpoint matching {prefix}*.jsonl"
+            )
+        return matches[-1]
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(args.output_dir, f"{prefix}{timestamp}.jsonl")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Private prediction synthetic text generation"
@@ -147,6 +354,10 @@ def main():
                         help="Device for inference")
     parser.add_argument("--output_dir", type=str, default="data/outputs",
                         help="Directory for output files")
+    parser.add_argument("--output_path", type=str, default=None,
+                        help="Explicit output JSONL path")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from an existing checkpointed output file")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--micro_batch_size", type=int, default=32,
@@ -224,6 +435,45 @@ def main():
     )
     model, tokenizer = load_model(model_config)
 
+    # Prepare output/checkpoint path
+    output_path = _resolve_output_path(args)
+
+    metadata = _build_run_metadata(
+        args=args,
+        report=report,
+        delta=delta,
+        max_priv=max_priv,
+        num_source_examples=len(examples),
+        output_path=output_path,
+    )
+
+    resumed_examples: List[SyntheticExample] = []
+    completed_batch_ids: Set[str] = set()
+    existing_metadata = None
+
+    if args.resume:
+        if not os.path.exists(output_path):
+            raise FileNotFoundError(
+                f"--resume requires an existing output file, but {output_path} was not found"
+            )
+        existing_metadata, resumed_examples, completed_batch_ids, _ = _load_resume_state(output_path)
+        if existing_metadata is None:
+            raise ValueError(f"Cannot resume from {output_path}: metadata header is missing")
+        if not _metadata_matches_args(existing_metadata, args, delta, max_priv, len(examples)):
+            raise ValueError(
+                f"Checkpoint metadata in {output_path} does not match the current command"
+            )
+        print(f"Resuming from {output_path}")
+        print(f"  Found {len(completed_batch_ids)} completed batches "
+              f"and {len(resumed_examples)} saved synthetic examples")
+    else:
+        if os.path.exists(output_path):
+            raise FileExistsError(
+                f"Refusing to overwrite existing output file: {output_path}. "
+                "Use --output_path to choose a different file or --resume to continue."
+            )
+        _write_metadata_header(output_path, metadata)
+
     # Generate
     print(f"\nStarting generation...")
     t0 = time.time()
@@ -238,32 +488,18 @@ def main():
         device=args.device,
         verbose=True,
         micro_batch_size=args.micro_batch_size,
+        completed_batch_ids=completed_batch_ids,
+        batch_callback=lambda descriptor, batch_examples: _append_completed_batch(
+            output_path, descriptor, batch_examples,
+        ),
     )
+
+    if resumed_examples:
+        synthetic_data = resumed_examples + synthetic_data
 
     elapsed = time.time() - t0
     print(f"\nGeneration took {elapsed:.1f}s")
 
-    # Save results
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(
-        args.output_dir,
-        f"{args.dataset}_eps{args.epsilon}_s{args.batch_size}_{timestamp}.jsonl",
-    )
-    metadata = {
-        "dataset": args.dataset,
-        "epsilon": report["epsilon"],
-        "delta": delta,
-        "batch_size": args.batch_size,
-        "clip_bound": args.clip_bound,
-        "temperature": args.temperature,
-        "svt_threshold": args.svt_threshold,
-        "svt_noise": args.svt_noise,
-        "max_private_tokens": max_priv,
-        "num_source_examples": len(examples),
-        "generation_time_seconds": elapsed,
-        "seed": args.seed,
-    }
-    save_synthetic_data(synthetic_data, output_path, metadata=metadata)
     print(f"Saved {len(synthetic_data)} examples to {output_path}")
 
     # Stats

@@ -91,10 +91,20 @@ def load_synthetic_data(input_path: str) -> Tuple[List[SyntheticExample], Option
     metadata = None
 
     with open(input_path) as f:
-        for line in f:
-            record = json.loads(line.strip())
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Allow interrupted checkpoint files with a truncated tail line.
+                print(f"Warning: ignoring unreadable JSONL tail at line {line_no} in {input_path}")
+                break
             if "_metadata" in record:
                 metadata = record["_metadata"]
+                continue
+            if "_batch_complete" in record:
                 continue
             examples.append(SyntheticExample(
                 text=record["text"],

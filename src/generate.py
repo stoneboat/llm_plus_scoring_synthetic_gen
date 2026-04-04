@@ -100,28 +100,63 @@ def partition_by_label(
     return batches_by_label
 
 
+def _format_prompt(tokenizer, user_content: str, response_prefix: str) -> str:
+    """Wrap a user message in the model's native chat template.
+
+    Uses tokenizer.apply_chat_template so that instruction-tuned models
+    receive proper role markers (e.g. <start_of_turn>user / model for
+    Gemma, [INST] for Llama, etc.) instead of raw text markers.
+
+    The leading <bos> emitted by some templates is stripped because the
+    tokenizer already adds one during tokenization.
+    """
+    messages = [{"role": "user", "content": user_content}]
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+    if formatted.startswith("<bos>"):
+        formatted = formatted[len("<bos>"):]
+    return formatted + response_prefix
+
+
 def build_prompts(
     examples: List[dict],
     dataset_name: str,
     text_column: str,
     label: int,
+    tokenizer=None,
 ) -> Tuple[List[str], str]:
     """Build private prompts for a batch plus the corresponding public prompt.
+
+    When *tokenizer* is provided the prompts are wrapped in the model's
+    chat template.  This is strongly recommended for instruction-tuned
+    models (Gemma IT, Llama Instruct, …) so that the model properly
+    enters response mode instead of treating role markers as plain text.
 
     Returns:
         (private_prompts, public_prompt)
     """
     templates = PROMPT_TEMPLATES[dataset_name]
     label_name = templates["labels"][label]
+    user_msg_tpl = templates["user_message"]
+    response_prefix = templates["response_prefix"]
 
     private_prompts = []
     for ex in examples:
-        prompt = templates["private"].format(
-            label=label_name, example=ex[text_column]
+        user_content = user_msg_tpl.format(
+            label=label_name, example=ex[text_column],
         )
+        if tokenizer is not None:
+            prompt = _format_prompt(tokenizer, user_content, response_prefix)
+        else:
+            prompt = f"# [User]\n{user_content}\n\n# [Assistant]\n{response_prefix}"
         private_prompts.append(prompt)
 
-    public_prompt = templates["public"].format(label=label_name, example="")
+    public_user = user_msg_tpl.format(label=label_name, example="")
+    if tokenizer is not None:
+        public_prompt = _format_prompt(tokenizer, public_user, response_prefix)
+    else:
+        public_prompt = f"# [User]\n{public_user}\n\n# [Assistant]\n{response_prefix}"
 
     return private_prompts, public_prompt
 
@@ -397,7 +432,8 @@ def generate_synthetic_dataset(
                       f"(label={label_name}, size={len(batch)})")
 
             private_prompts, public_prompt = build_prompts(
-                batch, dataset_name, text_column, label
+                batch, dataset_name, text_column, label,
+                tokenizer=tokenizer,
             )
 
             token_ids, n_priv, n_pub = generate_one_example(

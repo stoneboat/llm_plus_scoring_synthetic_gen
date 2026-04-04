@@ -63,60 +63,45 @@ class DatasetConfig:
 
 
 # Prompt templates from Appendix F of the paper.
-# The placeholder <EXAMPLE> is replaced with the actual sensitive text.
+#
+# Each dataset has:
+#   user_message  – the instruction shown to the LLM (with {label}/{example})
+#   response_prefix – the first tokens of the model's response that the
+#                     generated text should continue from (e.g. "Text:")
+#   labels        – mapping from integer label to human-readable name
+#
+# build_prompts() in generate.py wraps these in the model's native chat
+# template via tokenizer.apply_chat_template so that IT models get proper
+# role markers (<start_of_turn>, etc.) instead of raw "# [User]" text.
 PROMPT_TEMPLATES = {
     "agnews": {
-        "private": (
-            "# [User]\n"
+        "user_message": (
             "Here are texts with News Type: {label}.\n\n"
             "Text: {example}\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
+            "Please give me another one."
         ),
-        "public": (
-            "# [User]\n"
-            "Here are texts with News Type: {label}.\n\n"
-            "Text: \n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
-        ),
+        "response_prefix": "Text:",
         "labels": {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech"},
     },
     "trec": {
-        "private": (
-            "# [User]\n"
+        "user_message": (
             "Here are questions with Answer Type: {label}.\n\n"
             "```\nText: {example}\n```\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\n```\nQuestion:"
+            "Please give me another one."
         ),
-        "public": (
-            "# [User]\n"
-            "Here are questions with Answer Type: {label}.\n\n"
-            "```\nText: \n```\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\n```\nQuestion:"
-        ),
+        "response_prefix": "```\nQuestion:",
         "labels": {
             0: "Abbreviation", 1: "Entity", 2: "Description",
             3: "Human", 4: "Location", 5: "Number",
         },
     },
     "dbpedia": {
-        "private": (
-            "# [User]\n"
+        "user_message": (
             "Here are entries of Category: {label}.\n\n"
             "Entry: {example}\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nEntry:"
+            "Please give me another one."
         ),
-        "public": (
-            "# [User]\n"
-            "Here are entries of Category: {label}.\n\n"
-            "Entry: \n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nEntry:"
-        ),
+        "response_prefix": "Entry:",
         "labels": {
             0: "Company", 1: "School", 2: "Artist", 3: "Athlete",
             4: "Politician", 5: "Transportation", 6: "Building",
@@ -125,37 +110,21 @@ PROMPT_TEMPLATES = {
         },
     },
     "imdb": {
-        "private": (
-            "# [User]\n"
+        "user_message": (
             "Here are texts with Sentiment: {label}.\n\n"
             "Text: {example}\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
+            "Please give me another one."
         ),
-        "public": (
-            "# [User]\n"
-            "Here are texts with Sentiment: {label}.\n\n"
-            "Text: \n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
-        ),
+        "response_prefix": "Text:",
         "labels": {0: "Negative", 1: "Positive"},
     },
     "yelp": {
-        "private": (
-            "# [User]\n"
+        "user_message": (
             "Here are texts with Sentiment: {label}.\n\n"
             "Text: {example}\n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
+            "Please give me another one."
         ),
-        "public": (
-            "# [User]\n"
-            "Here are texts with Sentiment: {label}.\n\n"
-            "Text: \n\n"
-            "Please give me another one.\n\n"
-            "# [Assistant]\nText:"
-        ),
+        "response_prefix": "Text:",
         "labels": {0: "Negative", 1: "Positive"},
     },
 }

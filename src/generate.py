@@ -152,7 +152,8 @@ def build_prompts(
             prompt = f"# [User]\n{user_content}\n\n# [Assistant]\n{response_prefix}"
         private_prompts.append(prompt)
 
-    public_user = user_msg_tpl.format(label=label_name, example="")
+    public_seed = templates.get("public_seed", "")
+    public_user = user_msg_tpl.format(label=label_name, example=public_seed)
     if tokenizer is not None:
         public_prompt = _format_prompt(tokenizer, public_user, response_prefix)
     else:
@@ -254,28 +255,26 @@ def get_next_token_logits(
 
 
 @torch.no_grad()
-def generate_one_example(
+def _generate_single_example(
     model,
     tokenizer,
     private_prompts: List[str],
     public_prompt: str,
     privacy_config: PrivacyConfig,
     gen_config: GenerationConfig,
+    remaining_private_budget: int,
     device: str = "cuda",
     micro_batch_size: int = 32,
 ) -> Tuple[List[int], int, int]:
-    """Generate one synthetic example from a batch of sensitive prompts.
+    """Generate one synthetic example (Algorithm 1, inner loop).
 
-    Implements the inner loop of Algorithm 1.
+    Produces tokens until EOS, the per-example length cap
+    (``gen_config.max_total_tokens``), or the *remaining_private_budget*
+    is exhausted — whichever comes first.
 
     Args:
-        model: HuggingFace causal LM.
-        tokenizer: tokenizer.
-        private_prompts: prompts containing sensitive data.
-        public_prompt: prompt without sensitive data.
-        privacy_config: privacy parameters (c, tau, theta, sigma).
-        gen_config: generation parameters (batch_size, max tokens).
-        device: torch device.
+        remaining_private_budget: how many private tokens this example
+            is still allowed to consume from the batch's total budget r.
 
     Returns:
         (generated_token_ids, num_private_tokens, num_public_tokens)
@@ -284,7 +283,6 @@ def generate_one_example(
     tau = privacy_config.temperature
     tau_pub = privacy_config.public_temperature
     s = gen_config.batch_size
-    r = gen_config.max_private_tokens
     eos_id = gen_config.eos_token_id
     top_k = gen_config.top_k_vocab
 
@@ -300,7 +298,8 @@ def generate_one_example(
     if svt_enabled:
         noisy_thresh = sample_noisy_threshold(theta, sigma)
 
-    while private_token_count < r and len(generated_tokens) < gen_config.max_total_tokens:
+    while (private_token_count < remaining_private_budget
+           and len(generated_tokens) < gen_config.max_total_tokens):
         private_logits = get_next_token_logits(
             model, tokenizer, private_prompts, generated_tokens, device,
             micro_batch_size=micro_batch_size,
@@ -334,7 +333,6 @@ def generate_one_example(
         else:
             z_bar = clip_and_aggregate(private_logits, c, s)
             if top_k > 0:
-                # Without SVT we still need public logits for the vocabulary mask.
                 public_logits = get_next_token_logits(
                     model, tokenizer, [public_prompt], generated_tokens, device,
                     micro_batch_size=micro_batch_size,
@@ -350,6 +348,91 @@ def generate_one_example(
             break
 
     return generated_tokens, private_token_count, public_token_count
+
+
+@torch.no_grad()
+def generate_batch_examples(
+    model,
+    tokenizer,
+    private_prompts: List[str],
+    public_prompt: str,
+    privacy_config: PrivacyConfig,
+    gen_config: GenerationConfig,
+    device: str = "cuda",
+    micro_batch_size: int = 32,
+) -> List[Tuple[List[int], int, int]]:
+    """Generate synthetic examples from one batch (Algorithm 1, outer loop).
+
+    The per-batch privacy budget *r* (``gen_config.max_private_tokens``)
+    is shared across all examples produced from this batch.  Each example
+    starts from a clean prompt context, generates until EOS or the
+    per-example length cap, and then the next example begins with the
+    remaining budget.
+
+    Returns:
+        List of (token_ids, num_private, num_public) tuples — one per
+        synthetic example produced from this batch.
+    """
+    r = gen_config.max_private_tokens
+    max_examples = max(r, 10)
+    results: List[Tuple[List[int], int, int]] = []
+    private_tokens_used = 0
+    consecutive_no_private = 0
+
+    while private_tokens_used < r and len(results) < max_examples:
+        remaining = r - private_tokens_used
+
+        token_ids, n_priv, n_pub = _generate_single_example(
+            model, tokenizer,
+            private_prompts, public_prompt,
+            privacy_config, gen_config,
+            remaining_private_budget=remaining,
+            device=device,
+            micro_batch_size=micro_batch_size,
+        )
+
+        private_tokens_used += n_priv
+
+        if token_ids:
+            results.append((token_ids, n_priv, n_pub))
+
+        if n_priv == 0 and n_pub == 0:
+            break
+
+        if n_priv == 0:
+            consecutive_no_private += 1
+            if consecutive_no_private >= 3:
+                break
+        else:
+            consecutive_no_private = 0
+
+    return results
+
+
+def generate_one_example(
+    model,
+    tokenizer,
+    private_prompts: List[str],
+    public_prompt: str,
+    privacy_config: PrivacyConfig,
+    gen_config: GenerationConfig,
+    device: str = "cuda",
+    micro_batch_size: int = 32,
+) -> Tuple[List[int], int, int]:
+    """Convenience wrapper: generate a single example using the full budget.
+
+    Kept for backward compatibility.  For the correct Algorithm 1
+    behaviour (multiple examples per batch), use
+    :func:`generate_batch_examples` instead.
+    """
+    return _generate_single_example(
+        model, tokenizer,
+        private_prompts, public_prompt,
+        privacy_config, gen_config,
+        remaining_private_budget=gen_config.max_private_tokens,
+        device=device,
+        micro_batch_size=micro_batch_size,
+    )
 
 
 def generate_synthetic_dataset(
@@ -422,6 +505,7 @@ def generate_synthetic_dataset(
 
     synthetic_data: List[SyntheticExample] = []
     batch_idx = 0
+    max_batch_private_tokens = 0
 
     for label, batches in batches_by_label.items():
         label_name = templates["labels"][label]
@@ -436,7 +520,7 @@ def generate_synthetic_dataset(
                 tokenizer=tokenizer,
             )
 
-            token_ids, n_priv, n_pub = generate_one_example(
+            batch_results = generate_batch_examples(
                 model, tokenizer,
                 private_prompts, public_prompt,
                 privacy_config, gen_config,
@@ -444,37 +528,55 @@ def generate_synthetic_dataset(
                 micro_batch_size=micro_batch_size,
             )
 
-            text = tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+            batch_priv_total = 0
+            batch_pub_total = 0
 
-            synthetic_data.append(SyntheticExample(
-                text=text,
-                label=label,
-                label_name=label_name,
-                num_private_tokens=n_priv,
-                num_public_tokens=n_pub,
-                num_total_tokens=len(token_ids),
-            ))
+            for token_ids, n_priv, n_pub in batch_results:
+                text = tokenizer.decode(
+                    token_ids, skip_special_tokens=True,
+                ).strip()
+
+                synthetic_data.append(SyntheticExample(
+                    text=text,
+                    label=label,
+                    label_name=label_name,
+                    num_private_tokens=n_priv,
+                    num_public_tokens=n_pub,
+                    num_total_tokens=len(token_ids),
+                ))
+                batch_priv_total += n_priv
+                batch_pub_total += n_pub
+
+            max_batch_private_tokens = max(
+                max_batch_private_tokens, batch_priv_total,
+            )
 
             if verbose:
-                pub_frac = n_pub / max(1, n_priv + n_pub) * 100
-                print(f"    -> {len(token_ids)} tokens "
-                      f"({n_priv} private, {n_pub} public = {pub_frac:.0f}% free)")
+                n_ex = len(batch_results)
+                pub_frac = (batch_pub_total
+                            / max(1, batch_priv_total + batch_pub_total) * 100)
+                print(f"    -> {n_ex} example(s), "
+                      f"{batch_priv_total} private + "
+                      f"{batch_pub_total} public tokens "
+                      f"({pub_frac:.0f}% free)")
 
     tokenizer.padding_side = orig_padding_side
 
     if verbose:
         total_priv = sum(e.num_private_tokens for e in synthetic_data)
         total_pub = sum(e.num_public_tokens for e in synthetic_data)
-        print(f"\nGenerated {len(synthetic_data)} synthetic examples")
+        print(f"\nGenerated {len(synthetic_data)} synthetic examples "
+              f"from {total_batches} batches")
         print(f"Total tokens: {total_priv} private, {total_pub} public")
         actual_eps = compute_epsilon(
-            max(e.num_private_tokens for e in synthetic_data),
+            max_batch_private_tokens,
             privacy_config.clip_bound,
             gen_config.batch_size,
             privacy_config.temperature,
             delta,
             privacy_config.svt_noise if privacy_config.svt_enabled else None,
         )
-        print(f"Actual epsilon (worst-case batch): {actual_eps:.4f}")
+        print(f"Actual epsilon (worst-case batch, "
+              f"{max_batch_private_tokens} private tokens): {actual_eps:.4f}")
 
     return synthetic_data

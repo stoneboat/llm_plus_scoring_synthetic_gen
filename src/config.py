@@ -65,10 +65,15 @@ class DatasetConfig:
 # Prompt templates from Appendix F of the paper.
 #
 # Each dataset has:
-#   user_message  – the instruction shown to the LLM (with {label}/{example})
-#   response_prefix – the first tokens of the model's response that the
-#                     generated text should continue from (e.g. "Text:")
-#   labels        – mapping from integer label to human-readable name
+#   user_message     – the instruction shown to the LLM (with {label}/{example})
+#   response_prefix  – the first tokens of the model's response that the
+#                      generated text should continue from (e.g. "Text:")
+#   public_seed      – short generic (non-sensitive) example used in the public
+#                      prompt so the model stays in "text generation" mode rather
+#                      than "helpful assistant" mode when SVT chooses the public
+#                      path.  The paper uses an empty string here; the seed is a
+#                      quality-of-life improvement that does not affect privacy.
+#   labels           – mapping from integer label to human-readable name
 #
 # build_prompts() in generate.py wraps these in the model's native chat
 # template via tokenizer.apply_chat_template so that IT models get proper
@@ -81,6 +86,7 @@ PROMPT_TEMPLATES = {
             "Please give me another one."
         ),
         "response_prefix": "Text:",
+        "public_seed": "Officials announced new policy changes effective immediately.",
         "labels": {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech"},
     },
     "trec": {
@@ -90,6 +96,7 @@ PROMPT_TEMPLATES = {
             "Please give me another one."
         ),
         "response_prefix": "```\nQuestion:",
+        "public_seed": "What is the capital of France?",
         "labels": {
             0: "Abbreviation", 1: "Entity", 2: "Description",
             3: "Human", 4: "Location", 5: "Number",
@@ -102,6 +109,10 @@ PROMPT_TEMPLATES = {
             "Please give me another one."
         ),
         "response_prefix": "Entry:",
+        "public_seed": (
+            "The Springfield Institute is a research organization "
+            "founded in 1952 and based in the United States."
+        ),
         "labels": {
             0: "Company", 1: "School", 2: "Artist", 3: "Athlete",
             4: "Politician", 5: "Transportation", 6: "Building",
@@ -116,6 +127,10 @@ PROMPT_TEMPLATES = {
             "Please give me another one."
         ),
         "response_prefix": "Text:",
+        "public_seed": (
+            "This film was a solid effort with strong performances "
+            "from the entire cast."
+        ),
         "labels": {0: "Negative", 1: "Positive"},
     },
     "yelp": {
@@ -125,6 +140,7 @@ PROMPT_TEMPLATES = {
             "Please give me another one."
         ),
         "response_prefix": "Text:",
+        "public_seed": "The service was prompt and the food arrived fresh.",
         "labels": {0: "Negative", 1: "Positive"},
     },
 }

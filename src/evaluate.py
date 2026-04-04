@@ -12,6 +12,9 @@ import json
 import os
 from typing import List, Dict, Optional, Tuple
 
+import torch
+from sklearn.metrics import accuracy_score, classification_report
+
 from src.generate import SyntheticExample
 from src.config import PROMPT_TEMPLATES
 
@@ -131,4 +134,96 @@ def compute_generation_stats(examples: List[SyntheticExample]) -> dict:
         "total_public_tokens": total_pub,
         "public_token_fraction": total_pub / max(1, total_all),
         "max_private_tokens_in_example": max(priv_tokens),
+    }
+
+
+# ── BERT fine-tuning evaluation ─────────────────────────────────────────────
+
+def finetune_and_evaluate(
+    train_texts: List[str],
+    train_labels: List[int],
+    test_texts: List[str],
+    test_labels: List[int],
+    num_labels: int,
+    bert_model: str = "bert-base-uncased",
+    epochs: int = 5,
+    batch_size: int = 32,
+    lr: float = 2e-5,
+    max_length: int = 128,
+    device: str = "cuda",
+    verbose: bool = True,
+) -> Dict:
+    """Fine-tune BERT on training data and evaluate on a test set.
+
+    This is the paper's primary evaluation metric (Section 5.2):
+    train a BERT-base classifier on synthetic examples and measure
+    test-set accuracy against the real AG News / IMDB / etc. labels.
+
+    Returns dict with accuracy, macro_f1, weighted_f1, and per_class report.
+    """
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    from torch.utils.data import DataLoader, TensorDataset
+
+    if verbose:
+        print(f"Fine-tuning {bert_model}  epochs={epochs} lr={lr} bs={batch_size}")
+
+    tokenizer = AutoTokenizer.from_pretrained(bert_model)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        bert_model, num_labels=num_labels,
+    ).to(device)
+
+    def encode(texts, labels):
+        enc = tokenizer(
+            texts, padding=True, truncation=True,
+            max_length=max_length, return_tensors="pt",
+        )
+        return TensorDataset(
+            enc["input_ids"], enc["attention_mask"],
+            torch.tensor(labels, dtype=torch.long),
+        )
+
+    train_loader = DataLoader(encode(train_texts, train_labels),
+                              batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(encode(test_texts, test_labels),
+                             batch_size=batch_size)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0.0
+        for batch in train_loader:
+            ids, mask, labs = [t.to(device) for t in batch]
+            loss = model(input_ids=ids, attention_mask=mask, labels=labs).loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+        if verbose:
+            print(f"  epoch {epoch+1}/{epochs}  loss={total_loss/len(train_loader):.4f}")
+
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            ids, mask, labs = [t.to(device) for t in batch]
+            preds = model(input_ids=ids, attention_mask=mask).logits.argmax(-1)
+            all_preds.extend(preds.cpu().tolist())
+            all_labels.extend(labs.cpu().tolist())
+
+    acc = accuracy_score(all_labels, all_preds)
+    report = classification_report(all_labels, all_preds, digits=4, output_dict=True)
+
+    if verbose:
+        print(f"  accuracy: {acc:.4f}")
+        print(classification_report(all_labels, all_preds, digits=4))
+
+    return {
+        "accuracy": acc,
+        "macro_f1": report["macro avg"]["f1-score"],
+        "weighted_f1": report["weighted avg"]["f1-score"],
+        "per_class": {
+            str(k): v for k, v in report.items()
+            if k not in ("accuracy", "macro avg", "weighted avg")
+        },
     }

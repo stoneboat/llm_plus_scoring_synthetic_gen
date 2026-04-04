@@ -154,6 +154,12 @@ def main():
     parser.add_argument("--top_k_vocab", type=int, default=0,
                         help="Restrict sampling to top-k of public logits (0=off, "
                              "paper uses 1024 at high temperature)")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Run BERT fine-tuning evaluation after generation")
+    parser.add_argument("--bert_epochs", type=int, default=5,
+                        help="BERT fine-tuning epochs (used with --evaluate)")
+    parser.add_argument("--max_test", type=int, default=None,
+                        help="Cap test examples for eval (default: all)")
 
     args = parser.parse_args()
 
@@ -268,6 +274,49 @@ def main():
             print(f"  {k}: {v:.4f}")
         else:
             print(f"  {k}: {v}")
+
+    # Optional downstream evaluation
+    if args.evaluate:
+        from src.evaluate import finetune_and_evaluate
+
+        DATASET_NUM_LABELS = {
+            "agnews": 4, "dbpedia": 14, "imdb": 2, "yelp": 2, "trec": 6,
+        }
+        DATASET_TEST_SPLIT = {
+            "agnews": ("fancyzhx/ag_news", "test", "text", "label"),
+            "dbpedia": ("fancyzhx/dbpedia_14", "test", "content", "label"),
+            "imdb": ("stanfordnlp/imdb", "test", "text", "label"),
+            "yelp": ("fancyzhx/yelp_polarity", "test", "text", "label"),
+            "trec": ("CogComp/trec", "test", "text", "coarse_label"),
+        }
+
+        hf_name, split, text_col, label_col = DATASET_TEST_SPLIT[args.dataset]
+        from datasets import load_dataset
+        print(f"\nLoading test set: {hf_name} ({split})...")
+        test_ds = load_dataset(hf_name, split=split, cache_dir="data/datasets")
+        if args.max_test and args.max_test < len(test_ds):
+            test_ds = test_ds.shuffle(seed=42).select(range(args.max_test))
+        test_texts = [row[text_col] for row in test_ds]
+        test_labels = [row[label_col] for row in test_ds]
+        print(f"  {len(test_texts)} test examples")
+
+        synth_texts = [e.text for e in synthetic_data]
+        synth_labels = [e.label for e in synthetic_data]
+
+        eval_results = finetune_and_evaluate(
+            synth_texts, synth_labels,
+            test_texts, test_labels,
+            num_labels=DATASET_NUM_LABELS[args.dataset],
+            epochs=args.bert_epochs,
+            device=args.device,
+        )
+        print(f"\nDownstream accuracy: {eval_results['accuracy']:.4f}")
+        print(f"Macro F1: {eval_results['macro_f1']:.4f}")
+
+        eval_path = output_path.replace(".jsonl", "_eval.json")
+        with open(eval_path, "w") as f:
+            json.dump(eval_results, f, indent=2)
+        print(f"Eval results saved to {eval_path}")
 
 
 if __name__ == "__main__":

@@ -38,6 +38,7 @@ class GenerationConfig:
     max_private_tokens: int = 100   # r: max private tokens per synthetic example
     max_total_tokens: int = 256     # absolute cap on output length (private + public)
     eos_token_id: Optional[int] = None  # set from tokenizer at runtime
+    top_k_vocab: int = 0            # restrict sampling to top-k of public logits (0 = off)
 
 
 @dataclass

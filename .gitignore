@@ -24,6 +24,8 @@ ENV/
 .idea/
 *.swp
 *.swo
+.codex/
+.claude/
 
 # Environment files
 .env

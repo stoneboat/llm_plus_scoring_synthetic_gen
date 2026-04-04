@@ -126,6 +126,28 @@ def build_prompts(
     return private_prompts, public_prompt
 
 
+def _apply_top_k_filter(
+    logits: Tensor,
+    public_logits: Tensor,
+    top_k: int,
+) -> Tensor:
+    """Restrict logits to the top-k tokens from the public prediction.
+
+    Large-vocabulary models (e.g. Gemma with 256K tokens) combined with
+    logit clipping raise the probability floor of nonsense tokens.
+    Filtering to the public prediction's top-k tokens avoids sampling
+    from that long tail.  The mask is a deterministic function of the
+    public (non-sensitive) logits, so it does not affect the privacy
+    guarantee.
+
+    Reference: Appendix F.1 of Amin et al. (2024) — used at τ ≥ 2.25.
+    """
+    _, top_indices = public_logits.topk(top_k, dim=-1)
+    mask = torch.full_like(logits, float("-inf"))
+    mask[top_indices] = 0.0
+    return logits + mask
+
+
 @torch.no_grad()
 def get_next_token_logits(
     model,
@@ -140,6 +162,11 @@ def get_next_token_logits(
     Each prompt is concatenated with the generated tokens so far, then
     we extract the logits for the next position.
 
+    IMPORTANT: The caller must set ``tokenizer.padding_side = "left"``
+    before invoking this function.  Causal LMs require left-padding so
+    that position -1 always corresponds to the last real token for every
+    sequence in the batch.
+
     Processes prompts in micro-batches to avoid GPU OOM when batch_size
     is large (e.g. 255) and the model has a large vocabulary (e.g. Gemma 2
     with 256k tokens), since the logits tensor would be
@@ -147,7 +174,7 @@ def get_next_token_logits(
 
     Args:
         model: HuggingFace causal LM.
-        tokenizer: corresponding tokenizer.
+        tokenizer: corresponding tokenizer (padding_side must be "left").
         prompts: list of prompt strings.
         generated_tokens: token IDs generated so far (shared across all prompts).
         device: torch device.
@@ -156,16 +183,10 @@ def get_next_token_logits(
     Returns:
         Logits tensor of shape (len(prompts), vocab_size).
     """
-    if generated_tokens:
-        suffix = tokenizer.decode(generated_tokens)
-        full_texts = [p + suffix for p in prompts]
-    else:
-        full_texts = prompts
-
     all_last_logits: List[Tensor] = []
 
-    for i in range(0, len(full_texts), micro_batch_size):
-        chunk = full_texts[i : i + micro_batch_size]
+    for i in range(0, len(prompts), micro_batch_size):
+        chunk = prompts[i : i + micro_batch_size]
         inputs = tokenizer(
             chunk,
             return_tensors="pt",
@@ -173,8 +194,24 @@ def get_next_token_logits(
             truncation=True,
         ).to(device)
 
+        # Preserve exact continuation tokens by appending token IDs directly.
+        # Decoding then re-tokenizing can alter whitespace/subword boundaries.
+        if generated_tokens:
+            batch_len = inputs["input_ids"].shape[0]
+            gen = torch.tensor(
+                generated_tokens, dtype=inputs["input_ids"].dtype, device=device
+            ).unsqueeze(0).expand(batch_len, -1)
+            gen_attn = torch.ones(
+                (batch_len, gen.shape[1]),
+                dtype=inputs["attention_mask"].dtype,
+                device=device,
+            )
+            inputs = {
+                "input_ids": torch.cat([inputs["input_ids"], gen], dim=1),
+                "attention_mask": torch.cat([inputs["attention_mask"], gen_attn], dim=1),
+            }
+
         outputs = model(**inputs)
-        # Extract logits at the last position only — shape (chunk, vocab_size)
         last_logits = outputs.logits[:, -1, :].cpu()
         all_last_logits.append(last_logits)
 
@@ -214,6 +251,7 @@ def generate_one_example(
     s = gen_config.batch_size
     r = gen_config.max_private_tokens
     eos_id = gen_config.eos_token_id
+    top_k = gen_config.top_k_vocab
 
     svt_enabled = privacy_config.svt_enabled
     theta = privacy_config.svt_threshold
@@ -223,46 +261,50 @@ def generate_one_example(
     private_token_count = 0
     public_token_count = 0
 
-    # Initialize noisy threshold for SVT
     noisy_thresh = None
     if svt_enabled:
         noisy_thresh = sample_noisy_threshold(theta, sigma)
 
     while private_token_count < r and len(generated_tokens) < gen_config.max_total_tokens:
-        # Get logits from all private prompts
         private_logits = get_next_token_logits(
             model, tokenizer, private_prompts, generated_tokens, device,
             micro_batch_size=micro_batch_size,
         )
 
         if svt_enabled:
-            # Get logits from public prompt
             public_logits = get_next_token_logits(
                 model, tokenizer, [public_prompt], generated_tokens, device,
                 micro_batch_size=micro_batch_size,
             )[0]  # (vocab_size,)
 
-            # SVT: decide private vs public
             use_private, _ = should_use_private_token(
                 private_logits, public_logits, s, noisy_thresh, sigma
             )
 
             if use_private:
-                # Private token: clip, aggregate, sample
                 z_bar = clip_and_aggregate(private_logits, c, s)
+                if top_k > 0:
+                    z_bar = _apply_top_k_filter(z_bar, public_logits, top_k)
                 probs = torch.softmax(z_bar / tau, dim=-1)
                 token_id = torch.multinomial(probs, num_samples=1).item()
                 private_token_count += 1
-                # Re-sample noisy threshold for next SVT query
                 noisy_thresh = sample_noisy_threshold(theta, sigma)
             else:
-                # Public token: sample from public distribution (free)
-                probs = torch.softmax(public_logits / tau_pub, dim=-1)
+                pub_logits = public_logits
+                if top_k > 0:
+                    pub_logits = _apply_top_k_filter(pub_logits, public_logits, top_k)
+                probs = torch.softmax(pub_logits / tau_pub, dim=-1)
                 token_id = torch.multinomial(probs, num_samples=1).item()
                 public_token_count += 1
         else:
-            # No SVT: every token is private
             z_bar = clip_and_aggregate(private_logits, c, s)
+            if top_k > 0:
+                # Without SVT we still need public logits for the vocabulary mask.
+                public_logits = get_next_token_logits(
+                    model, tokenizer, [public_prompt], generated_tokens, device,
+                    micro_batch_size=micro_batch_size,
+                )[0]
+                z_bar = _apply_top_k_filter(z_bar, public_logits, top_k)
             probs = torch.softmax(z_bar / tau, dim=-1)
             token_id = torch.multinomial(probs, num_samples=1).item()
             private_token_count += 1
@@ -310,6 +352,11 @@ def generate_synthetic_dataset(
     # Set EOS token
     if gen_config.eos_token_id is None:
         gen_config.eos_token_id = tokenizer.eos_token_id
+
+    # Causal LMs require left-padding so that position -1 is always the
+    # last real token for every sequence in the batch.
+    orig_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
 
     # Compute privacy budget
     delta = privacy_config.delta
@@ -376,6 +423,8 @@ def generate_synthetic_dataset(
                 pub_frac = n_pub / max(1, n_priv + n_pub) * 100
                 print(f"    -> {len(token_ids)} tokens "
                       f"({n_priv} private, {n_pub} public = {pub_frac:.0f}% free)")
+
+    tokenizer.padding_side = orig_padding_side
 
     if verbose:
         total_priv = sum(e.num_private_tokens for e in synthetic_data)

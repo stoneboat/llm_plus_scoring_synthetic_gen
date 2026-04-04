@@ -151,6 +151,9 @@ def main():
                         help="Random seed")
     parser.add_argument("--micro_batch_size", type=int, default=32,
                         help="Prompts per GPU forward pass (reduce if OOM, default 32)")
+    parser.add_argument("--top_k_vocab", type=int, default=0,
+                        help="Restrict sampling to top-k of public logits (0=off, "
+                             "paper uses 1024 at high temperature)")
 
     args = parser.parse_args()
 
@@ -194,6 +197,7 @@ def main():
         batch_size=args.batch_size,
         max_private_tokens=max_priv,
         max_total_tokens=args.max_total_tokens,
+        top_k_vocab=args.top_k_vocab,
     )
 
     # Print privacy report

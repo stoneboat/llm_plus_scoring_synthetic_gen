@@ -78,7 +78,7 @@ def test_import_privacy_accounting():
 def test_src_package_version():
     import src
     assert hasattr(src, "__version__"), "src package should expose __version__"
-    assert src.__version__ == "0.1.0"
+    assert src.__version__ == "0.2.0"
 
 
 # ---------------------------------------------------------------------------

@@ -31,21 +31,12 @@ from src.config import (
     GenerationConfig,
     ModelConfig,
     DatasetConfig,
-    PROMPT_TEMPLATES,
     compute_max_private_tokens,
 )
 from src.privacy_accounting import privacy_report
 from src.generate import BatchDescriptor, SyntheticExample, generate_synthetic_dataset
 from src.evaluate import compute_generation_stats
-
-
-DATASET_HF_MAP = {
-    "agnews": ("fancyzhx/ag_news", "train", "text", "label"),
-    "dbpedia": ("fancyzhx/dbpedia_14", "train", "content", "label"),
-    "imdb": ("stanfordnlp/imdb", "train", "text", "label"),
-    "yelp": ("fancyzhx/yelp_polarity", "train", "text", "label"),
-    "trec": ("CogComp/trec", "train", "text", "coarse_label"),
-}
+from src.datasets.registry import DATASET_CHOICES, get_adapter
 
 
 def load_dataset_examples(
@@ -54,29 +45,9 @@ def load_dataset_examples(
     cache_dir: str = "data/datasets",
 ) -> list:
     """Load dataset from HuggingFace and convert to list of dicts."""
-    from datasets import load_dataset
-
-    if dataset_name not in DATASET_HF_MAP:
-        raise ValueError(
-            f"Unknown dataset: {dataset_name}. "
-            f"Available: {list(DATASET_HF_MAP.keys())}"
-        )
-
-    hf_name, split, text_col, label_col = DATASET_HF_MAP[dataset_name]
-
-    print(f"Loading {hf_name} ({split} split)...")
-    ds = load_dataset(hf_name, split=split, cache_dir=cache_dir)
-
-    if num_examples is not None and num_examples < len(ds):
-        ds = ds.shuffle(seed=42).select(range(num_examples))
-
-    examples = []
-    for row in ds:
-        examples.append({
-            "text": row[text_col],
-            "label": row[label_col],
-        })
-
+    adapter = get_adapter(dataset_name)
+    print(f"Loading {adapter.hf_name} (train split)...")
+    examples = adapter.load("train", num_examples=num_examples, cache_dir=cache_dir)
     labels = set(e["label"] for e in examples)
     print(f"  Loaded {len(examples)} examples with {len(labels)} labels")
     return examples
@@ -323,7 +294,7 @@ def main():
 
     parser.add_argument(
         "--dataset", type=str, default="agnews",
-        choices=list(DATASET_HF_MAP.keys()),
+        choices=DATASET_CHOICES,
         help="Dataset to generate synthetic data for",
     )
     parser.add_argument("--num_examples", type=int, default=None,
@@ -515,25 +486,15 @@ def main():
     if args.evaluate:
         from src.evaluate import finetune_and_evaluate
 
-        DATASET_NUM_LABELS = {
-            "agnews": 4, "dbpedia": 14, "imdb": 2, "yelp": 2, "trec": 6,
-        }
-        DATASET_TEST_SPLIT = {
-            "agnews": ("fancyzhx/ag_news", "test", "text", "label"),
-            "dbpedia": ("fancyzhx/dbpedia_14", "test", "content", "label"),
-            "imdb": ("stanfordnlp/imdb", "test", "text", "label"),
-            "yelp": ("fancyzhx/yelp_polarity", "test", "text", "label"),
-            "trec": ("CogComp/trec", "test", "text", "coarse_label"),
-        }
-
-        hf_name, split, text_col, label_col = DATASET_TEST_SPLIT[args.dataset]
-        from datasets import load_dataset
-        print(f"\nLoading test set: {hf_name} ({split})...")
-        test_ds = load_dataset(hf_name, split=split, cache_dir="data/datasets")
-        if args.max_test and args.max_test < len(test_ds):
-            test_ds = test_ds.shuffle(seed=42).select(range(args.max_test))
-        test_texts = [row[text_col] for row in test_ds]
-        test_labels = [row[label_col] for row in test_ds]
+        adapter = get_adapter(args.dataset)
+        print(f"\nLoading test set: {adapter.hf_name} (test)...")
+        test_examples = adapter.load(
+            "test",
+            num_examples=args.max_test,
+            cache_dir="data/datasets",
+        )
+        test_texts = [e["text"] for e in test_examples]
+        test_labels = [e["label"] for e in test_examples]
         print(f"  {len(test_texts)} test examples")
 
         synth_texts = [e.text for e in synthetic_data]
@@ -542,7 +503,7 @@ def main():
         eval_results = finetune_and_evaluate(
             synth_texts, synth_labels,
             test_texts, test_labels,
-            num_labels=DATASET_NUM_LABELS[args.dataset],
+            num_labels=adapter.num_labels,
             epochs=args.bert_epochs,
             device=args.device,
         )

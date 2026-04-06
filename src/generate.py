@@ -10,9 +10,12 @@ Generates differentially private synthetic text by:
 
 Reference: Algorithm 1 in Amin et al. (2024), "Private prediction for large-scale
 synthetic text generation", Findings of EMNLP 2024.
+
+Phase 2 note: BatchDescriptor, assign_to_batch, partition_by_label, build_prompts,
+and _format_prompt now live in src/batching/ and src/prompts/ respectively.
+They are re-exported here so that existing call sites continue to work unchanged.
 """
 
-import math
 import hashlib
 from typing import Callable, List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
@@ -30,7 +33,22 @@ from src.privacy_accounting import (
     compute_epsilon,
     privacy_report,
 )
-from src.config import PrivacyConfig, GenerationConfig, ModelConfig, PROMPT_TEMPLATES
+from src.config import PrivacyConfig, GenerationConfig, ModelConfig
+
+# ---------------------------------------------------------------------------
+# Phase 2 imports: batching and prompt layers
+# ---------------------------------------------------------------------------
+from src.batching.base import BatchDescriptor, BatchingPolicy          # noqa: F401
+from src.batching.hash_label_policy import (                           # noqa: F401
+    assign_to_batch,
+    partition_by_label,
+    HashLabelBatchingPolicy,
+)
+from src.prompts.text_classification import (                          # noqa: F401
+    PROMPT_TEMPLATES,
+    build_prompts,
+    _format_prompt,
+)
 
 
 @dataclass
@@ -42,135 +60,6 @@ class SyntheticExample:
     num_private_tokens: int
     num_public_tokens: int
     num_total_tokens: int
-
-
-@dataclass(frozen=True)
-class BatchDescriptor:
-    """Stable identifier and metadata for one generation batch."""
-    batch_id: str
-    batch_index: int
-    total_batches: int
-    label: int
-    label_name: str
-    batch_size: int
-
-
-def assign_to_batch(prompt_text: str, num_batches: int) -> int:
-    """Assign a prompt to a batch using hashing (satisfies Assumption 1).
-
-    The batch assignment depends only on the prompt itself, not on other prompts.
-    """
-    h = int(hashlib.sha256(prompt_text.encode()).hexdigest(), 16)
-    return h % num_batches
-
-
-def partition_by_label(
-    examples: List[dict],
-    label_column: str,
-    text_column: str,
-    batch_size: int,
-) -> Dict[int, List[List[dict]]]:
-    """Partition examples into stable, disjoint batches grouped by label.
-
-    Returns a dict mapping label -> list of batches, where each batch
-    is a list of examples of size approximately batch_size.
-
-    The assignment is hash-based rather than slice-based so a record's batch
-    membership depends only on that record. This is the fixed-assignment
-    property needed for the paper's parallel-composition argument: adding or
-    removing one example affects only the batch containing that example, rather
-    than shifting many later examples between batches.
-    """
-    by_label: Dict[int, List[dict]] = {}
-    for ex in examples:
-        label = ex[label_column]
-        by_label.setdefault(label, []).append(ex)
-
-    batches_by_label: Dict[int, List[List[dict]]] = {}
-    for label, label_examples in by_label.items():
-        num_batches = max(1, math.ceil(len(label_examples) / batch_size))
-        buckets: List[List[dict]] = [[] for _ in range(num_batches)]
-
-        for ex in label_examples:
-            # Include the label in the hash key so identical texts from
-            # different labels cannot collide into the same label-local bucket.
-            key = f"{label}\n{ex[text_column]}"
-            batch_idx = assign_to_batch(key, num_batches)
-            buckets[batch_idx].append(ex)
-
-        # Drop empty buckets and sort deterministically for reproducibility.
-        non_empty_batches = []
-        for bucket in buckets:
-            if not bucket:
-                continue
-            bucket.sort(key=lambda ex: ex[text_column])
-            non_empty_batches.append(bucket)
-
-        batches_by_label[label] = non_empty_batches
-
-    return batches_by_label
-
-
-def _format_prompt(tokenizer, user_content: str, response_prefix: str) -> str:
-    """Wrap a user message in the model's native chat template.
-
-    Uses tokenizer.apply_chat_template so that instruction-tuned models
-    receive proper role markers (e.g. <start_of_turn>user / model for
-    Gemma, [INST] for Llama, etc.) instead of raw text markers.
-
-    The leading <bos> emitted by some templates is stripped because the
-    tokenizer already adds one during tokenization.
-    """
-    messages = [{"role": "user", "content": user_content}]
-    formatted = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    if formatted.startswith("<bos>"):
-        formatted = formatted[len("<bos>"):]
-    return formatted + response_prefix
-
-
-def build_prompts(
-    examples: List[dict],
-    dataset_name: str,
-    text_column: str,
-    label: int,
-    tokenizer=None,
-) -> Tuple[List[str], str]:
-    """Build private prompts for a batch plus the corresponding public prompt.
-
-    When *tokenizer* is provided the prompts are wrapped in the model's
-    chat template.  This is strongly recommended for instruction-tuned
-    models (Gemma IT, Llama Instruct, …) so that the model properly
-    enters response mode instead of treating role markers as plain text.
-
-    Returns:
-        (private_prompts, public_prompt)
-    """
-    templates = PROMPT_TEMPLATES[dataset_name]
-    label_name = templates["labels"][label]
-    user_msg_tpl = templates["user_message"]
-    response_prefix = templates["response_prefix"]
-
-    private_prompts = []
-    for ex in examples:
-        user_content = user_msg_tpl.format(
-            label=label_name, example=ex[text_column],
-        )
-        if tokenizer is not None:
-            prompt = _format_prompt(tokenizer, user_content, response_prefix)
-        else:
-            prompt = f"# [User]\n{user_content}\n\n# [Assistant]\n{response_prefix}"
-        private_prompts.append(prompt)
-
-    public_seed = templates.get("public_seed", "")
-    public_user = user_msg_tpl.format(label=label_name, example=public_seed)
-    if tokenizer is not None:
-        public_prompt = _format_prompt(tokenizer, public_user, response_prefix)
-    else:
-        public_prompt = f"# [User]\n{public_user}\n\n# [Assistant]\n{response_prefix}"
-
-    return private_prompts, public_prompt
 
 
 def _apply_top_k_filter(

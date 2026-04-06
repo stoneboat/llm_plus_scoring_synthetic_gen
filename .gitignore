@@ -1,6 +1,10 @@
 # Data directory (models, datasets, outputs)
 data/
 
+docs/notes/
+docs/papers/
+
+
 # Python
 __pycache__/
 *.py[cod]

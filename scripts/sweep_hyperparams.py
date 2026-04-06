@@ -46,22 +46,7 @@ from src.generate import generate_synthetic_dataset
 from src.evaluate import (
     save_synthetic_data, compute_generation_stats, finetune_and_evaluate,
 )
-
-DATASET_HF_MAP = {
-    "agnews": ("fancyzhx/ag_news", "text", "label", 4),
-    "dbpedia": ("fancyzhx/dbpedia_14", "content", "label", 14),
-    "imdb": ("stanfordnlp/imdb", "text", "label", 2),
-    "yelp": ("fancyzhx/yelp_polarity", "text", "label", 2),
-    "trec": ("CogComp/trec", "text", "coarse_label", 6),
-}
-
-DATASET_TEST_SPLIT = {
-    "agnews": ("fancyzhx/ag_news", "test", "text", "label"),
-    "dbpedia": ("fancyzhx/dbpedia_14", "test", "content", "label"),
-    "imdb": ("stanfordnlp/imdb", "test", "text", "label"),
-    "yelp": ("fancyzhx/yelp_polarity", "test", "text", "label"),
-    "trec": ("CogComp/trec", "test", "text", "coarse_label"),
-}
+from src.datasets.registry import DATASET_CHOICES, get_adapter
 
 # Grid: each entry is (temperature, svt_threshold, svt_noise, top_k_vocab)
 DEFAULT_GRID = [
@@ -76,25 +61,14 @@ DEFAULT_GRID = [
 
 
 def load_data(dataset_name, split, num_examples, cache_dir="data/datasets"):
-    from datasets import load_dataset as hf_load
-
-    _, text_col, label_col, _ = DATASET_HF_MAP[dataset_name]
-    hf_name = DATASET_TEST_SPLIT[dataset_name][0]
-
-    ds = hf_load(hf_name, split=split, cache_dir=cache_dir)
-    if num_examples and num_examples < len(ds):
-        ds = ds.shuffle(seed=42).select(range(num_examples))
-
-    examples = []
-    for row in ds:
-        examples.append({"text": row[text_col], "label": row[label_col]})
-    return examples
+    adapter = get_adapter(dataset_name)
+    return adapter.load(split, num_examples=num_examples, cache_dir=cache_dir)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Hyperparameter sweep")
     parser.add_argument("--dataset", default="agnews",
-                        choices=list(DATASET_HF_MAP.keys()))
+                        choices=DATASET_CHOICES)
     parser.add_argument("--epsilon", type=float, default=3.0)
     parser.add_argument("--delta", type=float, default=None)
     parser.add_argument("--batch_size", type=int, default=255)
@@ -119,7 +93,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    _, _, _, num_labels = DATASET_HF_MAP[args.dataset]
+    num_labels = get_adapter(args.dataset).num_labels
 
     # Load source data
     print("Loading source data...")

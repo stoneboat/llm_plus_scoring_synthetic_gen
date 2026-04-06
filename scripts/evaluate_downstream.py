@@ -40,37 +40,18 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.evaluate import load_synthetic_data
-from src.config import PROMPT_TEMPLATES
-
-DATASET_HF_MAP = {
-    "agnews": ("fancyzhx/ag_news", "test", "text", "label", 4),
-    "dbpedia": ("fancyzhx/dbpedia_14", "test", "content", "label", 14),
-    "imdb": ("stanfordnlp/imdb", "test", "text", "label", 2),
-    "yelp": ("fancyzhx/yelp_polarity", "test", "text", "label", 2),
-    "trec": ("CogComp/trec", "test", "text", "coarse_label", 6),
-}
-
-DATASET_HF_TRAIN_MAP = {
-    "agnews": ("fancyzhx/ag_news", "train", "text", "label"),
-    "dbpedia": ("fancyzhx/dbpedia_14", "train", "content", "label"),
-    "imdb": ("stanfordnlp/imdb", "train", "text", "label"),
-    "yelp": ("fancyzhx/yelp_polarity", "train", "text", "label"),
-    "trec": ("CogComp/trec", "train", "text", "coarse_label"),
-}
+from src.prompts import PROMPT_TEMPLATES
+from src.datasets.registry import DATASET_CHOICES, get_adapter
 
 
 def load_test_set(dataset_name: str, cache_dir: str = "data/datasets",
                   max_examples: Optional[int] = None) -> Tuple[List[str], List[int]]:
     """Load the real test set from HuggingFace."""
-    from datasets import load_dataset as hf_load
-
-    hf_name, split, text_col, label_col, _ = DATASET_HF_MAP[dataset_name]
-    print(f"Loading test set: {hf_name} ({split})...")
-    ds = hf_load(hf_name, split=split, cache_dir=cache_dir)
-    if max_examples and max_examples < len(ds):
-        ds = ds.shuffle(seed=42).select(range(max_examples))
-    texts = [row[text_col] for row in ds]
-    labels = [row[label_col] for row in ds]
+    adapter = get_adapter(dataset_name)
+    print(f"Loading test set: {adapter.hf_name} (test)...")
+    examples = adapter.load("test", num_examples=max_examples, cache_dir=cache_dir)
+    texts = [e["text"] for e in examples]
+    labels = [e["label"] for e in examples]
     print(f"  {len(texts)} test examples, {len(set(labels))} classes")
     return texts, labels
 
@@ -78,15 +59,11 @@ def load_test_set(dataset_name: str, cache_dir: str = "data/datasets",
 def load_real_train(dataset_name: str, cache_dir: str = "data/datasets",
                     max_examples: Optional[int] = None) -> Tuple[List[str], List[int]]:
     """Load the real training set (for baseline comparison)."""
-    from datasets import load_dataset as hf_load
-
-    hf_name, split, text_col, label_col = DATASET_HF_TRAIN_MAP[dataset_name]
-    print(f"Loading real training set: {hf_name} ({split})...")
-    ds = hf_load(hf_name, split=split, cache_dir=cache_dir)
-    if max_examples and max_examples < len(ds):
-        ds = ds.shuffle(seed=42).select(range(max_examples))
-    texts = [row[text_col] for row in ds]
-    labels = [row[label_col] for row in ds]
+    adapter = get_adapter(dataset_name)
+    print(f"Loading real training set: {adapter.hf_name} (train)...")
+    examples = adapter.load("train", num_examples=max_examples, cache_dir=cache_dir)
+    texts = [e["text"] for e in examples]
+    labels = [e["label"] for e in examples]
     print(f"  {len(texts)} training examples")
     return texts, labels
 
@@ -290,7 +267,7 @@ def main():
     parser.add_argument("--synthetic_path", type=str, default=None,
                         help="Path to synthetic JSONL file")
     parser.add_argument("--dataset", type=str, default="agnews",
-                        choices=list(DATASET_HF_MAP.keys()))
+                        choices=DATASET_CHOICES)
     parser.add_argument("--mode", type=str, default="finetune",
                         choices=["finetune", "icl"],
                         help="Evaluation mode: finetune (BERT) or icl")
@@ -319,7 +296,7 @@ def main():
     if not args.synthetic_path and not args.use_real_train:
         parser.error("Provide --synthetic_path or --use_real_train")
 
-    _, _, _, _, num_labels = DATASET_HF_MAP[args.dataset]
+    num_labels = get_adapter(args.dataset).num_labels
 
     # Load test set
     test_texts, test_labels = load_test_set(

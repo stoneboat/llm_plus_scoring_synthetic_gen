@@ -3,11 +3,18 @@ Hyperparameters and configuration for private prediction synthetic text generati
 
 Reference: Table 7 in Amin et al. (2024), "Private prediction for large-scale
 synthetic text generation", Findings of EMNLP 2024.
+
+Phase 2 note: PROMPT_TEMPLATES was moved to src/prompts/text_classification.py.
+It is re-exported here so that existing ``from src.config import PROMPT_TEMPLATES``
+imports continue to work unchanged.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 import math
+
+# Backward-compatible re-export: PROMPT_TEMPLATES now lives in src/prompts/.
+from src.prompts.text_classification import PROMPT_TEMPLATES  # noqa: F401
 
 
 @dataclass
@@ -60,90 +67,6 @@ class DatasetConfig:
     num_examples: Optional[int] = None  # None = use full dataset
     label_column: str = "label"
     text_column: str = "text"
-
-
-# Prompt templates from Appendix F of the paper.
-#
-# Each dataset has:
-#   user_message     – the instruction shown to the LLM (with {label}/{example})
-#   response_prefix  – the first tokens of the model's response that the
-#                      generated text should continue from (e.g. "Text:")
-#   public_seed      – short generic (non-sensitive) example used in the public
-#                      prompt so the model stays in "text generation" mode rather
-#                      than "helpful assistant" mode when SVT chooses the public
-#                      path.  The paper uses an empty string here; the seed is a
-#                      quality-of-life improvement that does not affect privacy.
-#   labels           – mapping from integer label to human-readable name
-#
-# build_prompts() in generate.py wraps these in the model's native chat
-# template via tokenizer.apply_chat_template so that IT models get proper
-# role markers (<start_of_turn>, etc.) instead of raw "# [User]" text.
-PROMPT_TEMPLATES = {
-    "agnews": {
-        "user_message": (
-            "Here are texts with News Type: {label}.\n\n"
-            "Text: {example}\n\n"
-            "Please give me another one."
-        ),
-        "response_prefix": "Text:",
-        "public_seed": "Officials announced new policy changes effective immediately.",
-        "labels": {0: "World", 1: "Sports", 2: "Business", 3: "Sci/Tech"},
-    },
-    "trec": {
-        "user_message": (
-            "Here are questions with Answer Type: {label}.\n\n"
-            "```\nText: {example}\n```\n\n"
-            "Please give me another one."
-        ),
-        "response_prefix": "```\nQuestion:",
-        "public_seed": "What is the capital of France?",
-        "labels": {
-            0: "Abbreviation", 1: "Entity", 2: "Description",
-            3: "Human", 4: "Location", 5: "Number",
-        },
-    },
-    "dbpedia": {
-        "user_message": (
-            "Here are entries of Category: {label}.\n\n"
-            "Entry: {example}\n\n"
-            "Please give me another one."
-        ),
-        "response_prefix": "Entry:",
-        "public_seed": (
-            "The Springfield Institute is a research organization "
-            "founded in 1952 and based in the United States."
-        ),
-        "labels": {
-            0: "Company", 1: "School", 2: "Artist", 3: "Athlete",
-            4: "Politician", 5: "Transportation", 6: "Building",
-            7: "Nature", 8: "Village", 9: "Animal", 10: "Plant",
-            11: "Album", 12: "Film", 13: "Book",
-        },
-    },
-    "imdb": {
-        "user_message": (
-            "Here are texts with Sentiment: {label}.\n\n"
-            "Text: {example}\n\n"
-            "Please give me another one."
-        ),
-        "response_prefix": "Text:",
-        "public_seed": (
-            "This film was a solid effort with strong performances "
-            "from the entire cast."
-        ),
-        "labels": {0: "Negative", 1: "Positive"},
-    },
-    "yelp": {
-        "user_message": (
-            "Here are texts with Sentiment: {label}.\n\n"
-            "Text: {example}\n\n"
-            "Please give me another one."
-        ),
-        "response_prefix": "Text:",
-        "public_seed": "The service was prompt and the food arrived fresh.",
-        "labels": {0: "Negative", 1: "Positive"},
-    },
-}
 
 
 # Pre-defined hyperparameter sweep grid from Table 7

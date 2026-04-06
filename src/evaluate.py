@@ -89,6 +89,9 @@ def load_synthetic_data(input_path: str) -> Tuple[List[SyntheticExample], Option
     """
     examples = []
     metadata = None
+    batch_examples: Dict[str, List[SyntheticExample]] = {}
+    completed_batch_ids: List[str] = []
+    saw_batch_markers = False
 
     with open(input_path) as f:
         for line_no, raw_line in enumerate(f, start=1):
@@ -105,15 +108,28 @@ def load_synthetic_data(input_path: str) -> Tuple[List[SyntheticExample], Option
                 metadata = record["_metadata"]
                 continue
             if "_batch_complete" in record:
+                saw_batch_markers = True
+                completed_batch_ids.append(record["_batch_complete"]["batch_id"])
                 continue
-            examples.append(SyntheticExample(
+
+            example = SyntheticExample(
                 text=record["text"],
                 label=record["label"],
                 label_name=record["label_name"],
                 num_private_tokens=record["num_private_tokens"],
                 num_public_tokens=record["num_public_tokens"],
                 num_total_tokens=record["num_total_tokens"],
-            ))
+            )
+            batch_id = record.get("batch_id")
+            if batch_id is not None:
+                batch_examples.setdefault(batch_id, []).append(example)
+            examples.append(example)
+
+    if saw_batch_markers:
+        completed_examples: List[SyntheticExample] = []
+        for batch_id in completed_batch_ids:
+            completed_examples.extend(batch_examples.get(batch_id, []))
+        examples = completed_examples
 
     return examples, metadata
 

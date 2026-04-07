@@ -4,7 +4,7 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "private-prediction-synth"
-version = "0.2.0"
+version = "0.3.0"
 description = "Private prediction synthetic text generation (Amin et al. 2024)"
 readme = "README.md"
 requires-python = ">=3.9"

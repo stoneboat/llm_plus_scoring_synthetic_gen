@@ -14,6 +14,12 @@ synthetic text generation", Findings of EMNLP 2024.
 Phase 2 note: BatchDescriptor, assign_to_batch, partition_by_label, build_prompts,
 and _format_prompt now live in src/batching/ and src/prompts/ respectively.
 They are re-exported here so that existing call sites continue to work unchanged.
+
+Phase 3 note: get_next_token_logits, _apply_top_k_filter, and
+_generate_single_example now live in src/backends/ and src/mechanisms/
+respectively.  They are re-exported here for backward compatibility.
+generate_synthetic_dataset and generate_batch_examples now delegate to
+HuggingFaceCausalLM + PrivatePredictionMechanism internally.
 """
 
 import hashlib
@@ -23,11 +29,6 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from src.clip_utils import clip_logits, clip_and_aggregate
-from src.sparse_vector import (
-    sample_noisy_threshold,
-    should_use_private_token,
-)
 from src.privacy_accounting import (
     compute_max_private_tokens,
     compute_epsilon,
@@ -50,6 +51,15 @@ from src.prompts.text_classification import (                          # noqa: F
     _format_prompt,
 )
 
+# ---------------------------------------------------------------------------
+# Phase 3 imports: backend and mechanism layers
+# ---------------------------------------------------------------------------
+from src.backends.huggingface_causal_lm import HuggingFaceCausalLM    # noqa: F401
+from src.mechanisms.private_prediction import (                        # noqa: F401
+    PrivatePredictionMechanism,
+    _apply_top_k_filter,
+)
+
 
 @dataclass
 class SyntheticExample:
@@ -62,27 +72,9 @@ class SyntheticExample:
     num_total_tokens: int
 
 
-def _apply_top_k_filter(
-    logits: Tensor,
-    public_logits: Tensor,
-    top_k: int,
-) -> Tensor:
-    """Restrict logits to the top-k tokens from the public prediction.
-
-    Large-vocabulary models (e.g. Gemma with 256K tokens) combined with
-    logit clipping raise the probability floor of nonsense tokens.
-    Filtering to the public prediction's top-k tokens avoids sampling
-    from that long tail.  The mask is a deterministic function of the
-    public (non-sensitive) logits, so it does not affect the privacy
-    guarantee.
-
-    Reference: Appendix F.1 of Amin et al. (2024) — used at τ ≥ 2.25.
-    """
-    _, top_indices = public_logits.topk(top_k, dim=-1)
-    mask = torch.full_like(logits, float("-inf"))
-    mask[top_indices] = 0.0
-    return logits + mask
-
+# ---------------------------------------------------------------------------
+# Backward-compat wrappers for functions moved to Phase 3 modules
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def get_next_token_logits(
@@ -93,65 +85,10 @@ def get_next_token_logits(
     device: str = "cuda",
     micro_batch_size: int = 32,
 ) -> Tensor:
-    """Run LLM inference to get next-token logits for a set of prompts.
-
-    Each prompt is concatenated with the generated tokens so far, then
-    we extract the logits for the next position.
-
-    IMPORTANT: The caller must set ``tokenizer.padding_side = "left"``
-    before invoking this function.  Causal LMs require left-padding so
-    that position -1 always corresponds to the last real token for every
-    sequence in the batch.
-
-    Processes prompts in micro-batches to avoid GPU OOM when batch_size
-    is large (e.g. 255) and the model has a large vocabulary (e.g. Gemma 2
-    with 256k tokens), since the logits tensor would be
-    (batch × seq_len × vocab_size) which can exceed GPU memory.
-
-    Args:
-        model: HuggingFace causal LM.
-        tokenizer: corresponding tokenizer (padding_side must be "left").
-        prompts: list of prompt strings.
-        generated_tokens: token IDs generated so far (shared across all prompts).
-        device: torch device.
-        micro_batch_size: number of prompts to forward at once. Reduce if OOM.
-
-    Returns:
-        Logits tensor of shape (len(prompts), vocab_size).
-    """
-    all_last_logits: List[Tensor] = []
-
-    for i in range(0, len(prompts), micro_batch_size):
-        chunk = prompts[i : i + micro_batch_size]
-        inputs = tokenizer(
-            chunk,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        ).to(device)
-
-        # Preserve exact continuation tokens by appending token IDs directly.
-        # Decoding then re-tokenizing can alter whitespace/subword boundaries.
-        if generated_tokens:
-            batch_len = inputs["input_ids"].shape[0]
-            gen = torch.tensor(
-                generated_tokens, dtype=inputs["input_ids"].dtype, device=device
-            ).unsqueeze(0).expand(batch_len, -1)
-            gen_attn = torch.ones(
-                (batch_len, gen.shape[1]),
-                dtype=inputs["attention_mask"].dtype,
-                device=device,
-            )
-            inputs = {
-                "input_ids": torch.cat([inputs["input_ids"], gen], dim=1),
-                "attention_mask": torch.cat([inputs["attention_mask"], gen_attn], dim=1),
-            }
-
-        outputs = model(**inputs)
-        last_logits = outputs.logits[:, -1, :].cpu()
-        all_last_logits.append(last_logits)
-
-    return torch.cat(all_last_logits, dim=0).to(device)
+    """Backward-compat wrapper.  See HuggingFaceCausalLM.get_next_token_logits."""
+    backend = HuggingFaceCausalLM(model, tokenizer, device=device,
+                                  micro_batch_size=micro_batch_size)
+    return backend.get_next_token_logits(prompts, generated_tokens)
 
 
 @torch.no_grad()
@@ -166,88 +103,15 @@ def _generate_single_example(
     device: str = "cuda",
     micro_batch_size: int = 32,
 ) -> Tuple[List[int], int, int]:
-    """Generate one synthetic example (Algorithm 1, inner loop).
-
-    Produces tokens until EOS, the per-example length cap
-    (``gen_config.max_total_tokens``), or the *remaining_private_budget*
-    is exhausted — whichever comes first.
-
-    Args:
-        remaining_private_budget: how many private tokens this example
-            is still allowed to consume from the batch's total budget r.
-
-    Returns:
-        (generated_token_ids, num_private_tokens, num_public_tokens)
-    """
-    c = privacy_config.clip_bound
-    tau = privacy_config.temperature
-    tau_pub = privacy_config.public_temperature
-    s = gen_config.batch_size
-    eos_id = gen_config.eos_token_id
-    top_k = gen_config.top_k_vocab
-
-    svt_enabled = privacy_config.svt_enabled
-    theta = privacy_config.svt_threshold
-    sigma = privacy_config.svt_noise
-
-    generated_tokens: List[int] = []
-    private_token_count = 0
-    public_token_count = 0
-
-    noisy_thresh = None
-    if svt_enabled:
-        noisy_thresh = sample_noisy_threshold(theta, sigma)
-
-    while (private_token_count < remaining_private_budget
-           and len(generated_tokens) < gen_config.max_total_tokens):
-        private_logits = get_next_token_logits(
-            model, tokenizer, private_prompts, generated_tokens, device,
-            micro_batch_size=micro_batch_size,
-        )
-
-        if svt_enabled:
-            public_logits = get_next_token_logits(
-                model, tokenizer, [public_prompt], generated_tokens, device,
-                micro_batch_size=micro_batch_size,
-            )[0]  # (vocab_size,)
-
-            use_private, _ = should_use_private_token(
-                private_logits, public_logits, s, noisy_thresh, sigma
-            )
-
-            if use_private:
-                z_bar = clip_and_aggregate(private_logits, c, s)
-                if top_k > 0:
-                    z_bar = _apply_top_k_filter(z_bar, public_logits, top_k)
-                probs = torch.softmax(z_bar / tau, dim=-1)
-                token_id = torch.multinomial(probs, num_samples=1).item()
-                private_token_count += 1
-                noisy_thresh = sample_noisy_threshold(theta, sigma)
-            else:
-                pub_logits = public_logits
-                if top_k > 0:
-                    pub_logits = _apply_top_k_filter(pub_logits, public_logits, top_k)
-                probs = torch.softmax(pub_logits / tau_pub, dim=-1)
-                token_id = torch.multinomial(probs, num_samples=1).item()
-                public_token_count += 1
-        else:
-            z_bar = clip_and_aggregate(private_logits, c, s)
-            if top_k > 0:
-                public_logits = get_next_token_logits(
-                    model, tokenizer, [public_prompt], generated_tokens, device,
-                    micro_batch_size=micro_batch_size,
-                )[0]
-                z_bar = _apply_top_k_filter(z_bar, public_logits, top_k)
-            probs = torch.softmax(z_bar / tau, dim=-1)
-            token_id = torch.multinomial(probs, num_samples=1).item()
-            private_token_count += 1
-
-        generated_tokens.append(token_id)
-
-        if eos_id is not None and token_id == eos_id:
-            break
-
-    return generated_tokens, private_token_count, public_token_count
+    """Backward-compat wrapper.  See PrivatePredictionMechanism.generate_example."""
+    backend = HuggingFaceCausalLM(model, tokenizer, device=device,
+                                  micro_batch_size=micro_batch_size)
+    mechanism = PrivatePredictionMechanism(privacy_config, gen_config)
+    return mechanism.generate_example(
+        private_prompts, public_prompt, backend,
+        remaining_budget=remaining_private_budget,
+        max_total_tokens=gen_config.max_total_tokens,
+    )
 
 
 @torch.no_grad()
@@ -273,40 +137,11 @@ def generate_batch_examples(
         List of (token_ids, num_private, num_public) tuples — one per
         synthetic example produced from this batch.
     """
-    r = gen_config.max_private_tokens
-    max_examples = max(r, 10)
-    results: List[Tuple[List[int], int, int]] = []
-    private_tokens_used = 0
-    consecutive_no_private = 0
-
-    while private_tokens_used < r and len(results) < max_examples:
-        remaining = r - private_tokens_used
-
-        token_ids, n_priv, n_pub = _generate_single_example(
-            model, tokenizer,
-            private_prompts, public_prompt,
-            privacy_config, gen_config,
-            remaining_private_budget=remaining,
-            device=device,
-            micro_batch_size=micro_batch_size,
-        )
-
-        private_tokens_used += n_priv
-
-        if token_ids:
-            results.append((token_ids, n_priv, n_pub))
-
-        if n_priv == 0 and n_pub == 0:
-            break
-
-        if n_priv == 0:
-            consecutive_no_private += 1
-            if consecutive_no_private >= 3:
-                break
-        else:
-            consecutive_no_private = 0
-
-    return results
+    backend = HuggingFaceCausalLM(model, tokenizer, device=device,
+                                  micro_batch_size=micro_batch_size)
+    mechanism = PrivatePredictionMechanism(privacy_config, gen_config)
+    return _run_batch_generation(mechanism, backend, private_prompts, public_prompt,
+                                 gen_config)
 
 
 def generate_one_example(
@@ -334,6 +169,59 @@ def generate_one_example(
         micro_batch_size=micro_batch_size,
     )
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _run_batch_generation(
+    mechanism: PrivatePredictionMechanism,
+    backend: HuggingFaceCausalLM,
+    private_prompts: List[str],
+    public_prompt: str,
+    gen_config: GenerationConfig,
+) -> List[Tuple[List[int], int, int]]:
+    """Run the Algorithm 1 outer loop for one batch.
+
+    Repeatedly calls ``mechanism.generate_example`` until the batch's
+    private-token budget *r* is exhausted or the example cap is reached.
+    """
+    r = gen_config.max_private_tokens
+    max_examples = max(r, 10)
+    results: List[Tuple[List[int], int, int]] = []
+    private_tokens_used = 0
+    consecutive_no_private = 0
+
+    while private_tokens_used < r and len(results) < max_examples:
+        remaining = r - private_tokens_used
+
+        token_ids, n_priv, n_pub = mechanism.generate_example(
+            private_prompts, public_prompt, backend,
+            remaining_budget=remaining,
+            max_total_tokens=gen_config.max_total_tokens,
+        )
+
+        private_tokens_used += n_priv
+
+        if token_ids:
+            results.append((token_ids, n_priv, n_pub))
+
+        if n_priv == 0 and n_pub == 0:
+            break
+
+        if n_priv == 0:
+            consecutive_no_private += 1
+            if consecutive_no_private >= 3:
+                break
+        else:
+            consecutive_no_private = 0
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def generate_synthetic_dataset(
     model,
@@ -375,10 +263,15 @@ def generate_synthetic_dataset(
     if gen_config.eos_token_id is None:
         gen_config.eos_token_id = tokenizer.eos_token_id
 
+    # Build the backend once; it owns padding-side management and decoding.
+    backend = HuggingFaceCausalLM(model, tokenizer, device=device,
+                                  micro_batch_size=micro_batch_size)
+    mechanism = PrivatePredictionMechanism(privacy_config, gen_config)
+
     # Causal LMs require left-padding so that position -1 is always the
     # last real token for every sequence in the batch.
-    orig_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
+    orig_padding_side = backend.padding_side
+    backend.padding_side = "left"
 
     # Compute privacy budget
     delta = privacy_config.delta
@@ -441,15 +334,13 @@ def generate_synthetic_dataset(
 
             private_prompts, public_prompt = build_prompts(
                 batch, dataset_name, text_column, label,
-                tokenizer=tokenizer,
+                tokenizer=backend.tokenizer,
             )
 
-            batch_results = generate_batch_examples(
-                model, tokenizer,
+            batch_results = _run_batch_generation(
+                mechanism, backend,
                 private_prompts, public_prompt,
-                privacy_config, gen_config,
-                device=device,
-                micro_batch_size=micro_batch_size,
+                gen_config,
             )
 
             batch_examples: List[SyntheticExample] = []
@@ -457,9 +348,7 @@ def generate_synthetic_dataset(
             batch_pub_total = 0
 
             for token_ids, n_priv, n_pub in batch_results:
-                text = tokenizer.decode(
-                    token_ids, skip_special_tokens=True,
-                ).strip()
+                text = backend.decode(token_ids, skip_special_tokens=True).strip()
 
                 example = SyntheticExample(
                     text=text,
@@ -490,7 +379,7 @@ def generate_synthetic_dataset(
                       f"{batch_pub_total} public tokens "
                       f"({pub_frac:.0f}% free)")
 
-    tokenizer.padding_side = orig_padding_side
+    backend.padding_side = orig_padding_side
 
     if verbose:
         total_priv = sum(e.num_private_tokens for e in synthetic_data)

@@ -7,11 +7,15 @@ synthetic text generation", Findings of EMNLP 2024.
 Phase 2 note: PROMPT_TEMPLATES was moved to src/prompts/text_classification.py.
 It is re-exported here so that existing ``from src.config import PROMPT_TEMPLATES``
 imports continue to work unchanged.
+
+Phase 3 note: compute_max_private_tokens now delegates to the authoritative
+implementation in src/privacy_accounting.  The argument order here differs from
+that module (batch_size before clip_bound) — the wrapper preserves the original
+call-site contract.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
-import math
 
 # Backward-compatible re-export: PROMPT_TEMPLATES now lives in src/prompts/.
 from src.prompts.text_classification import PROMPT_TEMPLATES  # noqa: F401
@@ -91,40 +95,20 @@ SVT_SETTINGS = [
 def compute_max_private_tokens(
     target_epsilon: float,
     delta: float,
-    batch_size: int,
+    batch_size: int,       # NOTE: order differs from privacy_accounting version
     clip_bound: float,
     temperature: float,
     svt_noise: Optional[float] = None,
 ) -> int:
-    """Estimate maximum private tokens r for a given privacy budget.
+    """Backward-compat wrapper around src/privacy_accounting.compute_max_private_tokens.
 
-    Uses the simplified formula from Theorem 1:
-        epsilon = rho + sqrt(4 * rho * log(1/delta))
-    where rho = r * rho_per_token.
+    The argument order here (batch_size before clip_bound) is preserved for
+    existing call sites.  The authoritative implementation is in
+    :func:`src.privacy_accounting.compute_max_private_tokens`.
     """
-    rho_exp = 0.5 * (clip_bound / (batch_size * temperature)) ** 2
-    rho_svt = 0.0
-    if svt_noise is not None and svt_noise > 0:
-        rho_svt = 2.0 / (batch_size * svt_noise) ** 2
-    rho_per_token = rho_exp + rho_svt
-
-    if rho_per_token <= 0:
-        return 10000
-
-    # Solve: eps = r*rho_per_token + sqrt(4 * r*rho_per_token * log(1/delta))
-    # Let x = r * rho_per_token (total rho). Solve eps = x + sqrt(4*x*log(1/delta))
-    # Rearranging: (eps - x)^2 = 4*x*log(1/delta) => x^2 - 2*eps*x + eps^2 = 4*x*L
-    # => x^2 - (2*eps + 4*L)*x + eps^2 = 0
-    log_inv_delta = math.log(1.0 / delta)
-    a = 1.0
-    b = -(2.0 * target_epsilon + 4.0 * log_inv_delta)
-    c_coeff = target_epsilon ** 2
-    discriminant = b ** 2 - 4.0 * a * c_coeff
-    if discriminant < 0:
-        return 1
-    total_rho = (-b - math.sqrt(discriminant)) / (2.0 * a)
-    if total_rho <= 0:
-        return 1
-
-    r = int(total_rho / rho_per_token)
-    return max(1, r)
+    from src.privacy_accounting import (
+        compute_max_private_tokens as _authoritative,
+    )
+    # privacy_accounting signature: (target_epsilon, delta, clip_bound, batch_size, ...)
+    return _authoritative(target_epsilon, delta, clip_bound, batch_size,
+                          temperature, svt_noise)

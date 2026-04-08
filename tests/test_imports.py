@@ -78,7 +78,19 @@ def test_import_privacy_accounting():
 def test_src_package_version():
     import src
     assert hasattr(src, "__version__"), "src package should expose __version__"
-    assert src.__version__ == "0.4.0"
+    assert src.__version__ == "0.5.0"
+
+
+def test_import_evaluation():
+    from src.evaluation import (
+        load_test_set,
+        load_real_train,
+        load_synthetic_for_eval,
+        finetune_bert,
+        build_icl_prompt,
+        icl_evaluate,
+        save_eval_results,
+    )
 
 
 def test_import_runtime():

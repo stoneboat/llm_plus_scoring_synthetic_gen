@@ -6,6 +6,19 @@ Supports two evaluation modes from the paper:
 2. Fine-tuning: train a classifier on synthetic data, evaluate on real test data
 
 Reference: Sections 5.1 and 5.2 of Amin et al. (2024).
+
+Phase 5 note: BERT fine-tuning has been consolidated into
+src/evaluation/finetune.py.  ``finetune_and_evaluate`` is now a re-export of
+``src.evaluation.finetune.finetune_bert`` with an identical signature, so all
+existing callers (scripts, sweep) are unaffected.
+
+The following functions remain canonical here (not moved) because they are
+independently tested, widely imported, and serve roles beyond evaluation:
+  - save_synthetic_data    — write generated examples to a simple JSONL file
+  - load_synthetic_data    — read JSONL with batch-marker semantics
+  - compute_generation_stats — generation diagnostics (not downstream eval)
+  - format_icl_prompt      — simple ICL prompt formatter (format differs from
+                             the balanced evaluation formatter in evaluation/icl.py)
 """
 
 import json
@@ -15,8 +28,12 @@ from typing import List, Dict, Optional, Tuple
 import torch
 from sklearn.metrics import accuracy_score, classification_report
 
-from src.generate import SyntheticExample
+from src.runtime.generation import SyntheticExample
 from src.config import PROMPT_TEMPLATES
+
+# Phase 5: finetune_and_evaluate is now the evaluation layer's finetune_bert.
+# Imported here as a re-export so all existing callers remain unaffected.
+from src.evaluation.finetune import finetune_bert as finetune_and_evaluate  # noqa: F401
 
 
 def format_icl_prompt(
@@ -29,6 +46,11 @@ def format_icl_prompt(
 
     Follows the evaluation format from Figure 2 in the paper.
 
+    Note: this is the simple "Classify the following examples / Answer:"
+    format.  The balanced per-label evaluation format used in
+    ``src.evaluation.icl.build_icl_prompt`` is a separate function
+    with different prompt structure.
+
     Args:
         synthetic_examples: generated synthetic data.
         test_text: the real test example to classify.
@@ -38,7 +60,7 @@ def format_icl_prompt(
     Returns:
         Formatted ICL prompt string.
     """
-    templates = PROMPT_TEMPLATES[dataset_name]
+    templates = PROMPT_TEMPLATES[dataset_name]  # noqa: F841 (templates referenced for future label use)
 
     lines = ["Classify the following examples:"]
     for ex in synthetic_examples[:num_shots]:
@@ -59,12 +81,16 @@ def save_synthetic_data(
 ) -> None:
     """Save synthetic examples to a JSONL file.
 
+    Writes a simple JSONL without batch markers or fsync.  For the full
+    checkpoint-format writer (batch markers, fsync, crash safety) use
+    ``src.artifacts.append_completed_batch``.
+
     Args:
         synthetic_examples: list of SyntheticExample.
         output_path: path to write the file.
         metadata: optional dict of experiment metadata to include in header.
     """
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     with open(output_path, "w") as f:
         if metadata:
@@ -83,6 +109,10 @@ def save_synthetic_data(
 
 def load_synthetic_data(input_path: str) -> Tuple[List[SyntheticExample], Optional[dict]]:
     """Load synthetic examples from a JSONL file.
+
+    Handles both the simple format (written by ``save_synthetic_data``) and the
+    full checkpoint format (with ``_batch_complete`` markers).  When markers are
+    present, only examples from completed batches are returned.
 
     Returns:
         (list of SyntheticExample, metadata dict or None)
@@ -135,7 +165,11 @@ def load_synthetic_data(input_path: str) -> Tuple[List[SyntheticExample], Option
 
 
 def compute_generation_stats(examples: List[SyntheticExample]) -> dict:
-    """Compute summary statistics over generated examples."""
+    """Compute summary statistics over generated examples.
+
+    Returns generation diagnostics (token counts, label distribution) rather
+    than downstream task metrics.  Used by scripts after generation completes.
+    """
     if not examples:
         return {}
 
@@ -160,96 +194,4 @@ def compute_generation_stats(examples: List[SyntheticExample]) -> dict:
         "total_public_tokens": total_pub,
         "public_token_fraction": total_pub / max(1, total_all),
         "max_private_tokens_in_example": max(priv_tokens),
-    }
-
-
-# ── BERT fine-tuning evaluation ─────────────────────────────────────────────
-
-def finetune_and_evaluate(
-    train_texts: List[str],
-    train_labels: List[int],
-    test_texts: List[str],
-    test_labels: List[int],
-    num_labels: int,
-    bert_model: str = "bert-base-uncased",
-    epochs: int = 5,
-    batch_size: int = 32,
-    lr: float = 2e-5,
-    max_length: int = 128,
-    device: str = "cuda",
-    verbose: bool = True,
-) -> Dict:
-    """Fine-tune BERT on training data and evaluate on a test set.
-
-    This is the paper's primary evaluation metric (Section 5.2):
-    train a BERT-base classifier on synthetic examples and measure
-    test-set accuracy against the real AG News / IMDB / etc. labels.
-
-    Returns dict with accuracy, macro_f1, weighted_f1, and per_class report.
-    """
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    from torch.utils.data import DataLoader, TensorDataset
-
-    if verbose:
-        print(f"Fine-tuning {bert_model}  epochs={epochs} lr={lr} bs={batch_size}")
-
-    tokenizer = AutoTokenizer.from_pretrained(bert_model)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        bert_model, num_labels=num_labels,
-    ).to(device)
-
-    def encode(texts, labels):
-        enc = tokenizer(
-            texts, padding=True, truncation=True,
-            max_length=max_length, return_tensors="pt",
-        )
-        return TensorDataset(
-            enc["input_ids"], enc["attention_mask"],
-            torch.tensor(labels, dtype=torch.long),
-        )
-
-    train_loader = DataLoader(encode(train_texts, train_labels),
-                              batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(encode(test_texts, test_labels),
-                             batch_size=batch_size)
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in train_loader:
-            ids, mask, labs = [t.to(device) for t in batch]
-            loss = model(input_ids=ids, attention_mask=mask, labels=labs).loss
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            total_loss += loss.item()
-        if verbose:
-            print(f"  epoch {epoch+1}/{epochs}  loss={total_loss/len(train_loader):.4f}")
-
-    model.eval()
-    all_preds, all_labels = [], []
-    with torch.no_grad():
-        for batch in test_loader:
-            ids, mask, labs = [t.to(device) for t in batch]
-            preds = model(input_ids=ids, attention_mask=mask).logits.argmax(-1)
-            all_preds.extend(preds.cpu().tolist())
-            all_labels.extend(labs.cpu().tolist())
-
-    acc = accuracy_score(all_labels, all_preds)
-    report = classification_report(all_labels, all_preds, digits=4, output_dict=True)
-
-    if verbose:
-        print(f"  accuracy: {acc:.4f}")
-        print(classification_report(all_labels, all_preds, digits=4))
-
-    return {
-        "accuracy": acc,
-        "macro_f1": report["macro avg"]["f1-score"],
-        "weighted_f1": report["weighted avg"]["f1-score"],
-        "per_class": {
-            str(k): v for k, v in report.items()
-            if k not in ("accuracy", "macro avg", "weighted avg")
-        },
     }

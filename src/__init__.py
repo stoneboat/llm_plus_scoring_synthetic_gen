@@ -9,6 +9,8 @@ Phase 3.5: privacy boundary strengthened into src/privacy/ package with
 explicit bounds, events, analyses, accountants, planning, and reporting layers.
 Phase 3.5b: PrivacyEvent now carries a PrivacyBound (not a raw rho scalar);
 PrivacyBound ABC added; accountant interface made more guarantee-family-neutral.
+Phase 4: runtime / orchestration extracted into src/runtime/; artifact writing
+and checkpoint I/O extracted into src/artifacts/.
 
 Install with ``pip install -e .`` to make ``from src.X import Y`` work
 without per-script sys.path manipulation.
@@ -17,4 +19,4 @@ See paper/refactor_phase1_report.md and paper/phase2_migration_report.md
 for change history.
 """
 
-__version__ = "0.3.6"
+__version__ = "0.4.0"

@@ -78,7 +78,26 @@ def test_import_privacy_accounting():
 def test_src_package_version():
     import src
     assert hasattr(src, "__version__"), "src package should expose __version__"
-    assert src.__version__ == "0.3.6"
+    assert src.__version__ == "0.4.0"
+
+
+def test_import_runtime():
+    from src.runtime import (
+        SyntheticExample,
+        run_batch_generation,
+        run_dataset_generation,
+    )
+
+
+def test_import_artifacts():
+    from src.artifacts import (
+        append_line,
+        batch_record,
+        write_metadata_header,
+        append_completed_batch,
+        load_resume_state,
+        build_run_metadata,
+    )
 
 
 # ---------------------------------------------------------------------------

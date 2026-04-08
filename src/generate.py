@@ -20,20 +20,20 @@ _generate_single_example now live in src/backends/ and src/mechanisms/
 respectively.  They are re-exported here for backward compatibility.
 generate_synthetic_dataset and generate_batch_examples now delegate to
 HuggingFaceCausalLM + PrivatePredictionMechanism internally.
+
+Phase 4 note: SyntheticExample, _run_batch_generation, and the dataset
+orchestration loop now live in src/runtime/generation.py.  They are
+re-exported here for backward compatibility.  generate_synthetic_dataset
+delegates to run_dataset_generation after constructing the backend and
+mechanism.
 """
 
-import hashlib
-from typing import Callable, List, Dict, Optional, Set, Tuple
-from dataclasses import dataclass
+from typing import Callable, List, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
 
-from src.privacy_accounting import (
-    compute_max_private_tokens,
-    compute_epsilon,
-    privacy_report,
-)
+from src.privacy_accounting import compute_max_private_tokens
 from src.config import PrivacyConfig, GenerationConfig, ModelConfig
 
 # ---------------------------------------------------------------------------
@@ -60,16 +60,17 @@ from src.mechanisms.private_prediction import (                        # noqa: F
     _apply_top_k_filter,
 )
 
+# ---------------------------------------------------------------------------
+# Phase 4 imports: runtime layer
+# ---------------------------------------------------------------------------
+from src.runtime.generation import (                                   # noqa: F401
+    SyntheticExample,
+    run_batch_generation,
+    run_dataset_generation,
+)
 
-@dataclass
-class SyntheticExample:
-    """A single generated synthetic example."""
-    text: str
-    label: int
-    label_name: str
-    num_private_tokens: int
-    num_public_tokens: int
-    num_total_tokens: int
+# Backward-compat alias used internally and re-exported.
+_run_batch_generation = run_batch_generation
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +141,8 @@ def generate_batch_examples(
     backend = HuggingFaceCausalLM(model, tokenizer, device=device,
                                   micro_batch_size=micro_batch_size)
     mechanism = PrivatePredictionMechanism(privacy_config, gen_config)
-    return _run_batch_generation(mechanism, backend, private_prompts, public_prompt,
-                                 gen_config)
+    return run_batch_generation(mechanism, backend, private_prompts, public_prompt,
+                                gen_config)
 
 
 def generate_one_example(
@@ -168,55 +169,6 @@ def generate_one_example(
         device=device,
         micro_batch_size=micro_batch_size,
     )
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _run_batch_generation(
-    mechanism: PrivatePredictionMechanism,
-    backend: HuggingFaceCausalLM,
-    private_prompts: List[str],
-    public_prompt: str,
-    gen_config: GenerationConfig,
-) -> List[Tuple[List[int], int, int]]:
-    """Run the Algorithm 1 outer loop for one batch.
-
-    Repeatedly calls ``mechanism.generate_example`` until the batch's
-    private-token budget *r* is exhausted or the example cap is reached.
-    """
-    r = gen_config.max_private_tokens
-    max_examples = max(r, 10)
-    results: List[Tuple[List[int], int, int]] = []
-    private_tokens_used = 0
-    consecutive_no_private = 0
-
-    while private_tokens_used < r and len(results) < max_examples:
-        remaining = r - private_tokens_used
-
-        token_ids, n_priv, n_pub = mechanism.generate_example(
-            private_prompts, public_prompt, backend,
-            remaining_budget=remaining,
-            max_total_tokens=gen_config.max_total_tokens,
-        )
-
-        private_tokens_used += n_priv
-
-        if token_ids:
-            results.append((token_ids, n_priv, n_pub))
-
-        if n_priv == 0 and n_pub == 0:
-            break
-
-        if n_priv == 0:
-            consecutive_no_private += 1
-            if consecutive_no_private >= 3:
-                break
-        else:
-            consecutive_no_private = 0
-
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +209,11 @@ def generate_synthetic_dataset(
     Returns:
         List of SyntheticExample objects.
     """
-    templates = PROMPT_TEMPLATES[dataset_name]
-
-    # Set EOS token
+    # Set EOS token before constructing the mechanism (which reads gen_config).
     if gen_config.eos_token_id is None:
         gen_config.eos_token_id = tokenizer.eos_token_id
 
-    # Build the backend once; it owns padding-side management and decoding.
+    # Build backend and mechanism once; shared across all batches.
     backend = HuggingFaceCausalLM(model, tokenizer, device=device,
                                   micro_batch_size=micro_batch_size)
     mechanism = PrivatePredictionMechanism(privacy_config, gen_config)
@@ -273,129 +223,27 @@ def generate_synthetic_dataset(
     orig_padding_side = backend.padding_side
     backend.padding_side = "left"
 
-    # Compute privacy budget
+    # Resolve delta (mutates privacy_config for downstream callers, preserved
+    # from pre-Phase-4 behaviour).
     delta = privacy_config.delta
     if delta is None:
         delta = 1.0 / len(examples)
         privacy_config.delta = delta
 
-    # Partition into batches by label
-    batches_by_label = partition_by_label(
-        examples, label_column, text_column, gen_config.batch_size
+    result = run_dataset_generation(
+        backend=backend,
+        mechanism=mechanism,
+        examples=examples,
+        dataset_name=dataset_name,
+        gen_config=gen_config,
+        privacy_config=privacy_config,
+        delta=delta,
+        text_column=text_column,
+        label_column=label_column,
+        completed_batch_ids=completed_batch_ids,
+        batch_callback=batch_callback,
+        verbose=verbose,
     )
 
-    total_batches = sum(len(bs) for bs in batches_by_label.values())
-    if verbose:
-        report = privacy_report(
-            gen_config.max_private_tokens,
-            privacy_config.clip_bound,
-            gen_config.batch_size,
-            privacy_config.temperature,
-            delta,
-            privacy_config.svt_noise if privacy_config.svt_enabled else None,
-        )
-        print(f"Privacy report: epsilon={report['epsilon']:.4f}, delta={delta:.2e}")
-        print(f"  rho/token={report['rho_per_token']:.6f}, "
-              f"total_rho={report['total_rho']:.6f}")
-        print(f"  {total_batches} batches, batch_size={gen_config.batch_size}")
-        print()
-
-    completed_batch_ids = completed_batch_ids or set()
-    synthetic_data: List[SyntheticExample] = []
-    batch_idx = 0
-    max_batch_private_tokens = 0
-
-    for label, batches in batches_by_label.items():
-        label_name = templates["labels"][label]
-        for batch in batches:
-            batch_idx += 1
-            batch_key = "\n".join(ex[text_column] for ex in batch)
-            batch_id = hashlib.sha256(
-                f"{dataset_name}\n{label}\n{batch_key}".encode("utf-8")
-            ).hexdigest()
-            descriptor = BatchDescriptor(
-                batch_id=batch_id,
-                batch_index=batch_idx,
-                total_batches=total_batches,
-                label=label,
-                label_name=label_name,
-                batch_size=len(batch),
-            )
-
-            if batch_id in completed_batch_ids:
-                if verbose:
-                    print(f"  Batch {batch_idx}/{total_batches} "
-                          f"(label={label_name}, size={len(batch)}) [resume: skipped]")
-                continue
-
-            if verbose:
-                print(f"  Batch {batch_idx}/{total_batches} "
-                      f"(label={label_name}, size={len(batch)})")
-
-            private_prompts, public_prompt = build_prompts(
-                batch, dataset_name, text_column, label,
-                tokenizer=backend.tokenizer,
-            )
-
-            batch_results = _run_batch_generation(
-                mechanism, backend,
-                private_prompts, public_prompt,
-                gen_config,
-            )
-
-            batch_examples: List[SyntheticExample] = []
-            batch_priv_total = 0
-            batch_pub_total = 0
-
-            for token_ids, n_priv, n_pub in batch_results:
-                text = backend.decode(token_ids, skip_special_tokens=True).strip()
-
-                example = SyntheticExample(
-                    text=text,
-                    label=label,
-                    label_name=label_name,
-                    num_private_tokens=n_priv,
-                    num_public_tokens=n_pub,
-                    num_total_tokens=len(token_ids),
-                )
-                synthetic_data.append(example)
-                batch_examples.append(example)
-                batch_priv_total += n_priv
-                batch_pub_total += n_pub
-
-            max_batch_private_tokens = max(
-                max_batch_private_tokens, batch_priv_total,
-            )
-
-            if batch_callback is not None:
-                batch_callback(descriptor, batch_examples)
-
-            if verbose:
-                n_ex = len(batch_results)
-                pub_frac = (batch_pub_total
-                            / max(1, batch_priv_total + batch_pub_total) * 100)
-                print(f"    -> {n_ex} example(s), "
-                      f"{batch_priv_total} private + "
-                      f"{batch_pub_total} public tokens "
-                      f"({pub_frac:.0f}% free)")
-
     backend.padding_side = orig_padding_side
-
-    if verbose:
-        total_priv = sum(e.num_private_tokens for e in synthetic_data)
-        total_pub = sum(e.num_public_tokens for e in synthetic_data)
-        print(f"\nGenerated {len(synthetic_data)} synthetic examples "
-              f"from {total_batches} batches")
-        print(f"Total tokens: {total_priv} private, {total_pub} public")
-        actual_eps = compute_epsilon(
-            max_batch_private_tokens,
-            privacy_config.clip_bound,
-            gen_config.batch_size,
-            privacy_config.temperature,
-            delta,
-            privacy_config.svt_noise if privacy_config.svt_enabled else None,
-        )
-        print(f"Actual epsilon (worst-case batch, "
-              f"{max_batch_private_tokens} private tokens): {actual_eps:.4f}")
-
-    return synthetic_data
+    return result

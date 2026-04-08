@@ -21,10 +21,9 @@ import hashlib
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-import torch
-
 from src.config import GenerationConfig, PrivacyConfig
-from src.privacy_accounting import compute_epsilon, privacy_report
+from src.privacy.planning import compute_epsilon
+from src.privacy.reporting import privacy_report
 from src.batching.base import BatchDescriptor
 from src.batching.hash_label_policy import partition_by_label
 from src.prompts.text_classification import PROMPT_TEMPLATES, build_prompts

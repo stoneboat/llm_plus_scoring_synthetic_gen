@@ -9,6 +9,7 @@ Public surface:
     SyntheticExample       — per-generated-example result dataclass
     run_batch_generation   — Algorithm 1 outer loop for one batch
     run_dataset_generation — full dataset-level orchestration loop
+    compute_generation_stats — summary statistics over generated examples
 """
 
 from src.runtime.generation import (  # noqa: F401
@@ -16,9 +17,11 @@ from src.runtime.generation import (  # noqa: F401
     run_batch_generation,
     run_dataset_generation,
 )
+from src.runtime.stats import compute_generation_stats  # noqa: F401
 
 __all__ = [
     "SyntheticExample",
     "run_batch_generation",
     "run_dataset_generation",
+    "compute_generation_stats",
 ]

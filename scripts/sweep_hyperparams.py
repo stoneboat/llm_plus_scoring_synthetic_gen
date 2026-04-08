@@ -21,15 +21,16 @@ Usage:
     # Use full dataset
     python scripts/sweep_hyperparams.py --dataset agnews --epsilon 3.0 \\
         --num_examples 120000
+
+This script is an optional research helper. The canonical generation workflow
+remains ``scripts/run_experiment.py`` with checkpoint/resume support.
 """
 
 import argparse
-import itertools
 import json
 import os
 import sys
 import time
-from dataclasses import asdict
 
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
@@ -38,15 +39,14 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.config import (
-    PrivacyConfig, GenerationConfig, ModelConfig,
-    compute_max_private_tokens as cfg_max_priv,
+    PrivacyConfig, GenerationConfig,
 )
-from src.privacy_accounting import privacy_report, compute_max_private_tokens
+from src.privacy import privacy_report, compute_max_private_tokens
 from src.generate import generate_synthetic_dataset
-from src.evaluate import (
-    save_synthetic_data, compute_generation_stats, finetune_and_evaluate,
-)
+from src.artifacts import save_synthetic_data
 from src.datasets.registry import DATASET_CHOICES, get_adapter
+from src.runtime import compute_generation_stats
+from src.evaluation import finetune_bert
 
 # Grid: each entry is (temperature, svt_threshold, svt_noise, top_k_vocab)
 DEFAULT_GRID = [
@@ -213,7 +213,7 @@ def main():
             print("\n  Running BERT evaluation...")
             synth_texts = [e.text for e in synthetic_data]
             synth_labels = [e.label for e in synthetic_data]
-            eval_results = finetune_and_evaluate(
+            eval_results = finetune_bert(
                 synth_texts, synth_labels,
                 test_texts, test_labels,
                 num_labels=num_labels,

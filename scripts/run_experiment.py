@@ -16,11 +16,10 @@ src/runtime/ (via src/generate/).
 """
 
 import argparse
-import json
 import os
 import sys
 import time
-from typing import List, Optional, Set
+from typing import List, Set
 
 # Reduce CUDA memory fragmentation, especially with large-vocabulary models
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -36,16 +35,17 @@ from src.config import (
     ModelConfig,
     compute_max_private_tokens,
 )
-from src.privacy_accounting import privacy_report
-from src.generate import BatchDescriptor, SyntheticExample, generate_synthetic_dataset
-from src.evaluate import compute_generation_stats
+from src.privacy.reporting import privacy_report
+from src.generate import generate_synthetic_dataset
 from src.datasets.registry import DATASET_CHOICES, get_adapter
+from src.runtime import SyntheticExample, compute_generation_stats
 from src.artifacts import (
     write_metadata_header,
     append_completed_batch,
     load_resume_state,
     build_run_metadata,
 )
+from src.evaluation import load_test_set, finetune_bert, save_eval_results
 
 
 def load_dataset_examples(
@@ -356,23 +356,16 @@ def main():
 
     # Optional downstream evaluation
     if args.evaluate:
-        from src.evaluate import finetune_and_evaluate
-
-        adapter = get_adapter(args.dataset)
-        print(f"\nLoading test set: {adapter.hf_name} (test)...")
-        test_examples = adapter.load(
-            "test",
-            num_examples=args.max_test,
-            cache_dir="data/datasets",
+        test_texts, test_labels = load_test_set(
+            args.dataset,
+            max_examples=args.max_test,
         )
-        test_texts = [e["text"] for e in test_examples]
-        test_labels = [e["label"] for e in test_examples]
-        print(f"  {len(test_texts)} test examples")
+        adapter = get_adapter(args.dataset)
 
         synth_texts = [e.text for e in synthetic_data]
         synth_labels = [e.label for e in synthetic_data]
 
-        eval_results = finetune_and_evaluate(
+        eval_results = finetune_bert(
             synth_texts, synth_labels,
             test_texts, test_labels,
             num_labels=adapter.num_labels,
@@ -383,9 +376,7 @@ def main():
         print(f"Macro F1: {eval_results['macro_f1']:.4f}")
 
         eval_path = output_path.replace(".jsonl", "_eval.json")
-        with open(eval_path, "w") as f:
-            json.dump(eval_results, f, indent=2)
-        print(f"Eval results saved to {eval_path}")
+        save_eval_results(eval_results, eval_path)
 
 
 if __name__ == "__main__":

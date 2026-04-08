@@ -33,8 +33,7 @@ from typing import Callable, List, Optional, Set, Tuple
 import torch
 from torch import Tensor
 
-from src.privacy_accounting import compute_max_private_tokens
-from src.config import PrivacyConfig, GenerationConfig, ModelConfig
+from src.config import PrivacyConfig, GenerationConfig
 
 # ---------------------------------------------------------------------------
 # Phase 2 imports: batching and prompt layers

@@ -63,26 +63,59 @@ python scripts/run_experiment.py \
 
 This example is aligned with the hyperparameter settings explored in Amin et al. (2024) for AG News.
 It uses the full training split by default and lets the script compute `max_private_tokens` from
-`epsilon`, `delta = 1/n`, and the chosen mechanism parameters. If you want to reproduce the paper's
-selection procedure more closely, run `scripts/sweep_hyperparams.py` and choose the best AG News
-configuration on a held-out validation split.
+`epsilon`, `delta = 1/n`, and the chosen mechanism parameters.
 
 Runs are checkpointed batch-by-batch to the output JSONL as they execute. If a long run is interrupted,
 resume it with the same arguments plus `--resume`. By default, the runner will pick the latest matching
 checkpoint in `data/outputs`; use `--output_path /path/to/file.jsonl` if you want to resume a specific file.
 
+Resume command for the existing AG News run artifact:
+
+```bash
+python scripts/run_experiment.py \
+  --dataset agnews \
+  --epsilon 3.0 \
+  --delta 8.333333333333334e-06 \
+  --batch_size 255 \
+  --clip_bound 10.0 \
+  --temperature 2.0 \
+  --public_temperature 1.5 \
+  --svt_threshold 0.5 \
+  --svt_noise 0.2 \
+  --top_k_vocab 1024 \
+  --max_private_tokens 177 \
+  --max_total_tokens 256 \
+  --seed 42 \
+  --micro_batch_size 32 \
+  --output_path data/outputs/agnews_eps3.0_s255_20260404_194803.jsonl \
+  --resume
+```
+
+`scripts/sweep_hyperparams.py` is still available as an optional research helper,
+but it is not the canonical workflow and it does not replace the checkpoint/resume
+path in `scripts/run_experiment.py`.
+
 ## Project Structure
 
-```
-src/                    Source code
-  config.py             Hyperparameters and privacy budget configuration
-  clip_utils.py         Logit clipping with recentering (Eq. 1)
-  sparse_vector.py      Sparse vector technique for public/private switching
-  privacy_accounting.py Thin wrapper around dp-accounting for Theorem 1
-  generate.py           Core Algorithm 1 — private synthetic text generation
-  evaluate.py           Downstream evaluation (ICL, fine-tuning)
+```text
+src/
+  datasets/             Dataset adapters and registry
+  prompts/              Prompt templates and builders
+  batching/             Fixed hash-based batch assignment
+  backends/             Model backend abstraction + HuggingFace implementation
+  mechanisms/           PrivatePredictionMechanism and helpers
+  privacy/              Bounds, events, analyses, planning, reporting
+  runtime/              Generation orchestration and generation stats
+  artifacts/            Checkpoint JSONL writing, metadata, resume, simple JSONL I/O
+  evaluation/           Downstream evaluation package
+  generate.py           Backward-compatible generation facade
+  evaluate.py           Backward-compatible evaluation facade
+  privacy_accounting.py Backward-compatible privacy facade
 scripts/
-  run_experiment.py     End-to-end experiment runner
+  run_experiment.py     Canonical generation command with checkpoint/resume
+  evaluate_downstream.py
+                        Canonical downstream evaluation command
+  sweep_hyperparams.py  Optional research helper
   local_scripts/        Machine-specific install scripts
 data/                   (gitignored) Models, datasets, outputs
 ```

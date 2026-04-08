@@ -15,7 +15,7 @@ load_synthetic_for_eval — load a saved synthetic JSONL file and return
 
 All dataset access goes through the adapter registry (src.datasets.registry)
 so that HuggingFace dataset routing and caching logic stays in one place.
-Synthetic-JSONL loading delegates to src.evaluate.load_synthetic_data so that
+Synthetic-JSONL loading delegates to src.artifacts.load_synthetic_data so that
 batch-marker semantics and the tested round-trip contract are not duplicated.
 """
 
@@ -77,15 +77,12 @@ def load_synthetic_for_eval(
 ) -> Tuple[List[str], List[int], List[str], Optional[dict]]:
     """Load a saved synthetic JSONL and extract evaluation-ready lists.
 
-    Delegates to ``src.evaluate.load_synthetic_data`` so that batch-marker
+    Delegates to ``src.artifacts.load_synthetic_data`` so that batch-marker
     resume semantics and the existing round-trip contract are preserved.
-
-    The import of ``load_synthetic_data`` is deferred to function body to
-    avoid a circular import (src.evaluate → src.evaluation → src.evaluate).
 
     Args:
         input_path: path to a synthetic ``.jsonl`` file produced by
-            ``src.artifacts`` or ``src.evaluate.save_synthetic_data``.
+            ``src.artifacts`` or the ``src.evaluate`` compatibility facade.
 
     Returns:
         A 4-tuple ``(texts, labels, label_names, metadata)``:
@@ -99,7 +96,7 @@ def load_synthetic_for_eval(
         metadata
             The ``_metadata`` dict from the file header, or ``None``.
     """
-    from src.evaluate import load_synthetic_data  # deferred: avoids circular import
+    from src.artifacts import load_synthetic_data
     examples, metadata = load_synthetic_data(input_path)
     texts = [e.text for e in examples]
     labels = [e.label for e in examples]

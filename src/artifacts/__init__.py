@@ -13,6 +13,8 @@ Public surface:
     batch_record             — build the per-example JSONL dict
     write_metadata_header    — create the output file and write ``_metadata``
     append_completed_batch   — append example records + ``_batch_complete`` marker
+    save_synthetic_data      — simple JSONL writer without checkpoint markers
+    load_synthetic_data      — reader for simple JSONL and checkpoint JSONL
     load_resume_state        — parse an existing checkpoint JSONL
     build_run_metadata       — assemble the run-metadata dict
 """
@@ -23,6 +25,10 @@ from src.artifacts.jsonl_writer import (  # noqa: F401
     write_metadata_header,
     append_completed_batch,
 )
+from src.artifacts.simple_jsonl import (  # noqa: F401
+    save_synthetic_data,
+    load_synthetic_data,
+)
 from src.artifacts.resume import load_resume_state  # noqa: F401
 from src.artifacts.metadata import build_run_metadata  # noqa: F401
 
@@ -31,6 +37,8 @@ __all__ = [
     "batch_record",
     "write_metadata_header",
     "append_completed_batch",
+    "save_synthetic_data",
+    "load_synthetic_data",
     "load_resume_state",
     "build_run_metadata",
 ]

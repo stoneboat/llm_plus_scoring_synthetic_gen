@@ -4,7 +4,7 @@ Evaluation result helpers.
 Phase 5: extracted from scripts/evaluate_downstream.py.
 
 Provides a single shared helper for persisting evaluation result dicts to JSON.
-Callers (scripts, sweep runners) should use ``save_eval_results`` rather than
+Callers (scripts and auxiliary tools) should use ``save_eval_results`` rather than
 inlining ``json.dump`` + ``os.makedirs`` at each call site.
 """
 

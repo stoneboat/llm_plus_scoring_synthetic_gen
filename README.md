@@ -91,10 +91,6 @@ python scripts/run_experiment.py \
   --resume
 ```
 
-`scripts/sweep_hyperparams.py` is still available as an optional research helper,
-but it is not the canonical workflow and it does not replace the checkpoint/resume
-path in `scripts/run_experiment.py`.
-
 ## Project Structure
 
 ```text
@@ -115,7 +111,6 @@ scripts/
   run_experiment.py     Canonical generation command with checkpoint/resume
   evaluate_downstream.py
                         Canonical downstream evaluation command
-  sweep_hyperparams.py  Optional research helper
   local_scripts/        Machine-specific install scripts
 data/                   (gitignored) Models, datasets, outputs
 ```

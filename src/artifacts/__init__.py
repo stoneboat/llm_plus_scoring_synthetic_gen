@@ -5,7 +5,7 @@ Phase 4: extracted from scripts/run_experiment.py.
 
 Provides crash-safe JSONL I/O, resume state loading, and run-metadata
 construction as reusable library functions so that scripts become thin
-wrappers and other callers (e.g. sweep scripts) can share the same
+wrappers and other callers can share the same
 checkpoint format without copy-pasting.
 
 Public surface:

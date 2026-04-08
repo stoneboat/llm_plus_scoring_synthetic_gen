@@ -29,7 +29,7 @@ def build_run_metadata(
     """Assemble the run-metadata payload for a checkpoint JSONL header.
 
     All parameters are explicit (no argparse namespace) so that this function
-    is usable from scripts, sweep runners, and tests alike.
+    is usable from scripts, other callers, and tests alike.
 
     Args:
         dataset: dataset name (e.g. ``"agnews"``).

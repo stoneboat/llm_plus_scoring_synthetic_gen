@@ -12,6 +12,10 @@ Phase 3 note: compute_max_private_tokens now delegates to the authoritative
 implementation in src/privacy_accounting.  The argument order here differs from
 that module (batch_size before clip_bound) — the wrapper preserves the original
 call-site contract.
+
+Phase 3.5 note: src/privacy_accounting.py is now a facade over src/privacy/.
+compute_max_private_tokens here delegates directly to src.privacy.planning to
+avoid an unnecessary extra hop through the facade.
 """
 
 from dataclasses import dataclass, field
@@ -100,15 +104,15 @@ def compute_max_private_tokens(
     temperature: float,
     svt_noise: Optional[float] = None,
 ) -> int:
-    """Backward-compat wrapper around src/privacy_accounting.compute_max_private_tokens.
+    """Backward-compat wrapper with legacy argument order (batch_size before clip_bound).
 
-    The argument order here (batch_size before clip_bound) is preserved for
-    existing call sites.  The authoritative implementation is in
-    :func:`src.privacy_accounting.compute_max_private_tokens`.
+    The authoritative implementation lives in :func:`src.privacy.planning.compute_max_private_tokens`
+    (argument order: clip_bound before batch_size).  This wrapper swaps the two
+    positional arguments so that existing call sites continue to work unchanged.
     """
-    from src.privacy_accounting import (
+    from src.privacy.planning import (
         compute_max_private_tokens as _authoritative,
     )
-    # privacy_accounting signature: (target_epsilon, delta, clip_bound, batch_size, ...)
+    # planning signature: (target_epsilon, delta, clip_bound, batch_size, ...)
     return _authoritative(target_epsilon, delta, clip_bound, batch_size,
                           temperature, svt_noise)
